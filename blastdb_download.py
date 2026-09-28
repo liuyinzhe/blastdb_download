@@ -100,7 +100,7 @@ try:                                    # Python >= 3.11
 except ModuleNotFoundError:             # pragma: no cover
     tomllib = None
 
-__version__ = "1.4.3"
+__version__ = "1.4.7"
 PROGRAM = "blastdb_download.py"
 STATE_BASENAME = ".blastdb-download.json"
 STATE_FORMAT = 1
@@ -295,6 +295,43 @@ def human_duration(seconds) -> str:
     return f"{hours}h{minutes:02d}m"
 
 
+def emit_dry_run(ctx, payload, lines) -> None:
+    """Dry-run output, machine readable when `--json` was requested.
+
+    `--json` promises that stdout carries nothing but the JSON document, so the
+    human-readable plan must not leak into it - a script piping the plan into
+    `jq` would otherwise get a parse error.
+    """
+    if ctx.json_out:
+        print(json.dumps(payload, indent=2, sort_keys=True, default=str))
+        return
+    for line in lines:
+        print(line)
+
+
+def describe_oserror(exc: OSError) -> str:
+    """Name a filesystem failure the way `docs/OPERATIONS.md` does.
+
+    A full disk, an exhausted quota or a read-only mount used to surface as
+    `unexpected OSError: [Errno 28] ...`, which the failure playbook cannot key
+    on; the sentences below are the ones it lists.
+    """
+    reason = {
+        errno.ENOSPC: "no space left on the filesystem",
+        errno.EDQUOT: "filesystem quota exceeded",
+        errno.EROFS: "the filesystem is mounted read-only",
+        errno.EACCES: "permission denied",
+        errno.EPERM: "operation not permitted",
+        errno.ENOENT: "no such file or directory",
+        errno.ELOOP: "too many levels of symbolic links",
+        errno.ENAMETOOLONG: "file name too long",
+    }.get(exc.errno)
+    where = f": {exc.filename}" if getattr(exc, "filename", None) else ""
+    if reason:
+        return f"{reason}{where}"
+    return f"{exc.strerror or exc}{where}"
+
+
 def human_bytes(n) -> str:
     if n is None:
         return "?"
@@ -304,6 +341,18 @@ def human_bytes(n) -> str:
             return f"{n:,.0f} {unit}" if unit == "B" else f"{n:,.2f} {unit}"
         n /= 1024.0
     return f"{n:.2f} PiB"
+
+
+def fmt_duration(seconds) -> str:
+    """A compact human duration: `12s`, `4m 05s`, `2h 07m`."""
+    seconds = max(0.0, float(seconds))
+    if seconds < 60:
+        return f"{seconds:.0f}s"
+    minutes, secs = divmod(int(round(seconds)), 60)
+    hours, minutes = divmod(minutes, 60)
+    if hours:
+        return f"{hours}h {minutes:02d}m"
+    return f"{minutes}m {secs:02d}s"
 
 
 def utcnow() -> str:
@@ -377,6 +426,19 @@ def sha1_hex(text: str) -> str:
 
 def b64_to_hex(b64: str) -> str:
     return base64.b64decode(b64).hex()
+
+
+def expand_path(value):
+    """Expand `~` and `$VARS` in a path that came from a shell, a config file or
+    the environment.
+
+    `os.path.abspath` does not do this, so `-r ~/db` (or `root = "~/db"` in a
+    config file) used to create a directory literally called `~` next to the
+    current working directory.
+    """
+    if not isinstance(value, str) or not value:
+        return value
+    return os.path.expanduser(os.path.expandvars(value))
 
 
 def fsync_dir(path: str) -> None:
@@ -486,6 +548,31 @@ def dir_size(path: str) -> int:
                 continue
             key = (st.st_dev, st.st_ino)
             if key in seen:
+                continue
+            seen.add(key)
+            total += st.st_size
+    return total
+
+
+def freed_bytes(path: str) -> int:
+    """How much space deleting `path` would actually release.
+
+    A snapshot shares its unchanged files with its neighbours as hard links, so
+    a snapshot's tree size is *not* what disappears when it is removed: only
+    names whose link count drops to zero give space back.  Reporting the tree
+    size made `gc` promise space it did not return - for `nt`, where one volume
+    of 345 changes per release, almost all of it.
+    """
+    total = 0
+    seen = set()
+    for root, _dirs, files in os.walk(path):
+        for name in files:
+            try:
+                st = os.stat(os.path.join(root, name))
+            except OSError:
+                continue
+            key = (st.st_dev, st.st_ino)
+            if key in seen or st.st_nlink > 1:
                 continue
             seen.add(key)
             total += st.st_size
@@ -2713,10 +2800,148 @@ class RootLock:
 # --------------------------------------------------------------------------- #
 # verification
 # --------------------------------------------------------------------------- #
-def verify_table(dbname, table, quick=False, check_md5=True):
+def file_identity(path):
+    """`(st_dev, st_ino, st_size, st_mtime_ns)` - proof that nothing was written.
+
+    The final gate uses it: a file the set-level gate just hashed, and that the
+    assembly then *hard-linked* into the snapshot, is the very same inode with
+    the same size and the same modification time, so hashing it again would only
+    repeat the same md5.  `link()` does not touch `mtime`, but writing the file
+    does, and a copy or a replaced file has another inode - all of those fall
+    back to hashing.
+    """
+    try:
+        st = os.stat(path)
+    except OSError:
+        return None
+    return (st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns)
+
+
+def verified_identities(table):
+    """{name: identity} for the entries whose checksum was just verified.
+
+    Call this *after* a strict `verify_table` pass over the same table: every
+    entry with a checksum has then been read and confirmed at `path`.
+    """
+    out = {}
+    for name, (path, meta) in table.items():
+        if (meta or {}).get("md5"):
+            ident = file_identity(path)
+            if ident is not None:
+                out[name] = ident
+    return out
+
+
+class Md5Pass:
+    """The full-payload md5 pass, reported as exactly two log lines.
+
+    Reading every byte of a database is the longest silent phase of a large run
+    (`nt` is ~1 TiB), so the operator gets one line when the pass starts - with
+    an estimate for the remaining bytes, sampled from the first file(s) - and
+    one line when it ends.  Nothing is printed per file: for `nt` that would be
+    thousands of lines.
+    """
+
+    SAMPLE_BYTES = 32 << 20          # sample at least this much ...
+    SAMPLE_SECONDS = 1.0             # ... or at least this long
+
+    def __init__(self, dbname, files, total, label="set-level verification",
+                 proven=0):
+        self.dbname = dbname
+        self.files = files
+        self.total = total
+        self.label = label
+        self.proven = proven
+        self.started = time.monotonic()
+        self.done_files = 0
+        self.done_bytes = 0
+        self.failed = 0
+        self.announced = False
+
+    @classmethod
+    def for_table(cls, dbname, table, label="set-level verification",
+                  proven=None):
+        """A pass over every file whose checksum still has to be read.
+
+        `proven` maps a name to the identity of the copy that was already
+        verified; such a file is not read again.
+        """
+        files = total = skipped = 0
+        for name, (path, meta) in table.items():
+            meta = meta or {}
+            if not meta.get("md5"):
+                continue
+            if proven is not None and proven.get(name) == file_identity(path):
+                skipped += 1
+                continue
+            size = meta.get("size")
+            if size is None:
+                try:
+                    size = os.path.getsize(path)
+                except OSError:
+                    continue
+            files += 1
+            total += size
+        if not files and not skipped:
+            return None
+        return cls(dbname, files, total, label, skipped)
+
+    def skip_note(self):
+        return (f", {self.proven} file(s) already proven by link identity"
+                if self.proven else "")
+
+    def rate(self):
+        elapsed = time.monotonic() - self.started
+        return self.done_bytes / elapsed if elapsed > 0 else 0.0
+
+    def file_done(self, size, failed=False):
+        """Called once per hashed file; announces the pass after a sample."""
+        self.done_files += 1
+        self.done_bytes += size or 0
+        if failed:
+            self.failed += 1
+        if self.announced:
+            return
+        if (self.done_bytes >= self.SAMPLE_BYTES
+                or time.monotonic() - self.started >= self.SAMPLE_SECONDS
+                or self.done_files >= self.files):
+            self.announced = True
+            rate = self.rate()
+            rest = max(0.0, self.total - self.done_bytes)
+            eta = fmt_duration(rest / rate) if rate else "?"
+            LOG.info(f"{self.dbname}: {self.label}: hashing "
+                     f"{self.files} file(s), {human_bytes(self.total)} with "
+                     f"md5 (ETA ~{eta}){self.skip_note()}")
+
+    def close(self):
+        """The closing line: how long the pass took and at what rate."""
+        elapsed = time.monotonic() - self.started
+        rate = self.done_bytes / elapsed if elapsed > 0 else 0.0
+        speed = f" ({human_bytes(rate)}/s)" if rate else ""
+        if not self.files:
+            # every file was already proven by identity: nothing was read
+            LOG.info(f"{self.dbname}: {self.label}: {self.proven} file(s) "
+                     f"proven by link identity, nothing re-read")
+            return
+        if not self.announced:                   # a database that fits in RAM
+            self.announced = True
+            LOG.info(f"{self.dbname}: {self.label}: hashing "
+                     f"{self.files} file(s), {human_bytes(self.total)} with "
+                     f"md5{self.skip_note()}")
+        tail = (f", {self.failed} checksum mismatch(es)" if self.failed else "")
+        LOG.info(f"{self.dbname}: {self.label}: hashed "
+                 f"{self.done_files} file(s), {human_bytes(self.done_bytes)} "
+                 f"in {fmt_duration(elapsed)}{speed}{tail}{self.skip_note()}")
+
+
+def verify_table(dbname, table, quick=False, check_md5=True,
+                 label="set-level verification", proven=None):
     issues = []
     markers = {}
     dates = {}
+    pass_ = (Md5Pass.for_table(dbname, table, label, proven)
+             if (check_md5 and not quick) else None)
+    hashed = proven_count = 0
     for name in sorted(table):
         path, meta = table[name]
         meta = meta or {}
@@ -2733,10 +2958,16 @@ def verify_table(dbname, table, quick=False, check_md5=True):
             issues.append(f"{name}: size {actual} != recorded {expected}")
             continue
         if check_md5 and not quick and meta.get("md5"):
-            got = md5_file(path)
-            if got != meta["md5"]:
-                issues.append(f"{name}: md5 {got} != recorded {meta['md5']}")
-                continue
+            if proven is not None and proven.get(name) == file_identity(path):
+                proven_count += 1        # the same inode the set-level gate read
+            else:
+                got = md5_file(path)
+                hashed += 1
+                if pass_ is not None:
+                    pass_.file_done(actual, failed=got != meta["md5"])
+                if got != meta["md5"]:
+                    issues.append(f"{name}: md5 {got} != recorded {meta['md5']}")
+                    continue
         elif meta.get("probe") and not probe_matches(path, meta["probe"]):
             issues.append(f"{name}: content probe mismatch (size {actual})")
             continue
@@ -2804,8 +3035,12 @@ def verify_table(dbname, table, quick=False, check_md5=True):
     for warning in meta_warnings:
         LOG.warn(f"{dbname}: {warning}")
 
+    if pass_ is not None:
+        pass_.close()
+
     info = {"volumes": len(vols), "build_dates": sorted(k for k in dates if k),
-            "markers": markers, "warnings": list(meta_warnings)}
+            "markers": markers, "warnings": list(meta_warnings),
+            "md5": {"hashed": hashed, "proven": proven_count}}
     return issues, info
 
 
@@ -2868,7 +3103,12 @@ def check_database_metadata(dbname, table, dates, vols):
                  for f in (js.get("files") or [])]
         if not flist or all(f.endswith(".tar.gz") for f in flist):
             continue                     # archive level metadata, nothing to add
-        expected = set(flist)
+        # the exclusion of shared taxonomy files has to be symmetric: `present`
+        # below drops them, so a metadata file that lists them (a real hazard
+        # for the payload-level metadata of a cloud snapshot, which lists
+        # members rather than archives) must not have them reported as missing
+        expected = ({f for f in flist if not is_shared_taxonomy(f)}
+                    or set(flist))
         present = {n for n in table
                    if not n.endswith(("-metadata.json", ".tar.gz"))
                    and not is_shared_taxonomy(n)}
@@ -2953,9 +3193,9 @@ class Context:
     def __init__(self, cfg, args):
         self.cfg = cfg
         self.args = args
-        self.root = os.path.abspath(cfg["root"])
+        self.root = os.path.abspath(expand_path(cfg["root"]))
         self.source = cfg["source"]
-        self.ncbi_dir = cfg["ncbi_dir"]
+        self.ncbi_dir = expand_path(cfg["ncbi_dir"])
         self.ncbi_base = (cfg["ncbi_base"] or NCBI_DEFAULT_BASE).rstrip("/")
         mode = cfg.get("ncbi_url") or "auto"
         if mode == "auto":
@@ -2980,12 +3220,13 @@ class Context:
         self.reuse_verify = cfg["reuse_verify"]
         self.min_free = int(cfg["min_free"] or 0)
         self.file_retries = max(1, int(cfg["file_retries"]))
-        self.progress_interval = float(cfg["progress_interval"])
-        self.log_file = cfg.get("log_file")
+        self.progress_interval = max(1.0, float(cfg["progress_interval"]))
+        self.log_file = expand_path(cfg.get("log_file"))
         self.auto_log = bool(cfg.get("auto_log", True))
         self.console = cfg.get("console") or "auto"
         self.user = cfg.get("user") or _current_user()
-        self.adopt_dirs = [os.path.abspath(d) for d in (cfg.get("adopt") or [])]
+        self.adopt_dirs = [os.path.abspath(expand_path(d))
+                           for d in (cfg.get("adopt") or [])]
         self.adopt_partial = bool(cfg.get("adopt_partial"))
         self.adopt_extracted = bool(cfg.get("adopt_extracted"))
         for directory in self.adopt_dirs:
@@ -2996,12 +3237,12 @@ class Context:
         self.torn_wait = float(cfg["torn_wait"])
         self.smoke_test = cfg["smoke_test"]
         self.disk_check = bool(cfg["disk_check"])
-        self.aria2c = cfg["aria2c"]
+        self.aria2c = expand_path(cfg["aria2c"])
         self.aria2c_extra = list(cfg["aria2c_extra_args"] or [])
         self.limit_rate = cfg["limit_rate"]
         self.json_out = bool(cfg["json"])
-        self.http = Http(timeout=cfg["timeout"], tries=self.tries,
-                         insecure=bool(cfg["insecure"]))
+        self.http = Http(timeout=max(1.0, float(cfg["timeout"])),
+                         tries=self.tries, insecure=bool(cfg["insecure"]))
         self.store = Store(self.root)
 
 
@@ -3952,52 +4193,80 @@ def cmd_download(ctx, args, auto_taxdb=True, allow_reuse=None):
     needed = sum(t.expected_disk_bytes() or 0 for t in work)
 
     if ctx.dry_run:
-        print(f"DRY-RUN: snapshot {tree_name_for(src, desired)} would contain "
-              f"{len(desired)} database(s); {len(work)} need fetching:")
+        payload = {"dry_run": True, "snapshot": tree_name_for(src, desired),
+                   "databases": {db: {"revkey": desired.get(db)}
+                                 for db in sorted(desired)},
+                   "need_fetching": [t.dbname for t in work],
+                   "free_bytes": free_space(ctx.root)}
+        lines = [f"DRY-RUN: snapshot {tree_name_for(src, desired)} would contain "
+                 f"{len(desired)} database(s); {len(work)} need fetching:"]
         for target in work:
             _reuse, pending = split_reuse(ctx, target, prev, allow_reuse)
             need = target.expected_disk_bytes()
-            print(f"  {target.dbname}: rev {target.revkey()}, "
-                  f"{len(target.files)} file(s), {len(pending)} to download, "
-                  f"about {human_bytes(need)} of disk"
-                  + (" (incl. one archive while unpacking)"
-                     if target.archives and not ctx.keep_archives else ""))
+            payload["databases"][target.dbname] = {
+                "revkey": target.revkey(), "files": len(target.files),
+                "to_fetch": len(pending), "disk_bytes": need,
+                "urls": [rf.url for rf in pending[:10]]}
+            lines.append(f"  {target.dbname}: rev {target.revkey()}, "
+                         f"{len(target.files)} file(s), {len(pending)} to "
+                         f"download, about {human_bytes(need)} of disk"
+                         + (" (incl. one archive while unpacking)"
+                            if target.archives and not ctx.keep_archives else ""))
             for rf in pending[:10]:
-                print(f"      {rf.url}")
+                lines.append(f"      {rf.url}")
             if len(pending) > 10:
-                print(f"      ... and {len(pending) - 10} more")
+                lines.append(f"      ... and {len(pending) - 10} more")
         free = free_space(ctx.root)
         if free is not None:
-            print(f"  free space on {ctx.root}: {human_bytes(free)}")
+            lines.append(f"  free space on {ctx.root}: {human_bytes(free)}")
+        emit_dry_run(ctx, payload, lines)
         return EXIT_OK
 
     disk_check(ctx, needed)
 
     if ctx.dry_run:
-        print(f"DRY-RUN: snapshot {tree_name_for(src, targets, prev, desired, work)} "
-              f"would contain {len(desired)} database(s); "
-              f"{len(work)} of them need fetching:")
+        payload = {"dry_run": True,
+                   "snapshot": tree_name_for(src, targets, prev, desired, work),
+                   "databases": {db: {"revkey": desired.get(db)}
+                                 for db in sorted(desired)},
+                   "need_fetching": [t.dbname for t in work]}
+        lines = [f"DRY-RUN: snapshot "
+                 f"{tree_name_for(src, targets, prev, desired, work)} "
+                 f"would contain {len(desired)} database(s); "
+                 f"{len(work)} of them need fetching:"]
         for target in work:
             _reuse, pending = split_reuse(ctx, target, prev, allow_reuse)
-            print(f"  {target.dbname}: rev {target.revkey()}, "
-                  f"{len(target.files)} file(s), "
-                  f"{len(pending)} to download")
+            payload["databases"][target.dbname] = {
+                "revkey": target.revkey(), "files": len(target.files),
+                "to_fetch": len(pending),
+                "urls": [rf.url for rf in pending[:10]]}
+            lines.append(f"  {target.dbname}: rev {target.revkey()}, "
+                         f"{len(target.files)} file(s), {len(pending)} to "
+                         f"download")
             for rf in pending[:10]:
-                print(f"      {rf.url}")
+                lines.append(f"      {rf.url}")
             if len(pending) > 10:
-                print(f"      ... and {len(pending) - 10} more")
+                lines.append(f"      ... and {len(pending) - 10} more")
+        emit_dry_run(ctx, payload, lines)
         return EXIT_OK
 
     # ---- download with torn-update detection ------------------------------ #
     attempt = 0
     tables = {}
+    proven_by_db = {}
     while True:
         attempt += 1
         try:
             tables = {}
+            proven_by_db = {}
             for target in work:
                 tables[target.dbname], _info = fetch_target(ctx, src, target,
                                                             prev, allow_reuse)
+                # remember *which inode* passed the set-level gate: the assembly
+                # hard-links those same files into the snapshot, so the final
+                # gate can prove them by identity instead of reading them again
+                proven_by_db[target.dbname] = verified_identities(
+                    tables[target.dbname])
             stale = []
             for target in work:
                 again = src.revision(target.dbname, fresh=True)
@@ -4117,10 +4386,15 @@ def cmd_download(ctx, args, auto_taxdb=True, allow_reuse=None):
     }
 
     if ctx.dry_run:
-        print(f"DRY-RUN would create a snapshot with {len(all_tables)} "
-              f"database(s), {len(tree)} file(s):")
-        for dbname in sorted(all_tables):
-            print(f"  {dbname}: rev {desired.get(dbname)}")
+        emit_dry_run(ctx,
+                     {"dry_run": True, "snapshot": name,
+                      "databases": {db: desired.get(db)
+                                    for db in sorted(all_tables)},
+                      "files": len(tree)},
+                     [f"DRY-RUN would create a snapshot with {len(all_tables)} "
+                      f"database(s), {len(tree)} file(s):"]
+                     + [f"  {dbname}: rev {desired.get(dbname)}"
+                        for dbname in sorted(all_tables)])
         return EXIT_OK
 
     content_hash = sha1_hex("\n".join(
@@ -4134,7 +4408,7 @@ def cmd_download(ctx, args, auto_taxdb=True, allow_reuse=None):
             st = db_meta.get(dbname) or {}
             issues, _info = verify_table(
                 dbname, table_from_state(snap, st.get("files")),
-                quick=False, check_md5=True)
+                quick=False, check_md5=True, label="final verification")
             if issues:
                 LOG.warn(f"existing snapshot {snap.name} fails verification for "
                          f"{dbname}: {issues[0]}")
@@ -4150,7 +4424,9 @@ def cmd_download(ctx, args, auto_taxdb=True, allow_reuse=None):
         st = db_meta.get(dbname) or {}
         issues.extend(f"{dbname}: {m}" for m in
                       verify_table(dbname, table_from_state(snapshot, st.get("files")),
-                                   quick=False, check_md5=args.check_md5)[0])
+                                   quick=False, check_md5=args.check_md5,
+                                   label="final verification",
+                                   proven=proven_by_db.get(dbname))[0])
     issues.extend(f"smoke: {m}" for m in smoke_test(ctx, snapshot,
                                                     sorted(all_tables)))
     if issues:
@@ -4238,6 +4514,11 @@ def drop_staging(ctx, keep_revkeys=None, dbnames=None):
 
 
 def gc_snapshots(ctx, keep, dry_run, protect=None):
+    """Remove snapshots beyond `keep`; returns [(name, freed_bytes), ...].
+
+    `gc` and its dry run report the same numbers: the bytes that removing the
+    directory actually releases (`freed_bytes`).
+    """
     protect = set(protect or ())
     if ctx.store.current_name():
         protect.add(ctx.store.current_name())
@@ -4247,17 +4528,21 @@ def gc_snapshots(ctx, keep, dry_run, protect=None):
         if len(keep_set) >= keep:
             break
         keep_set.add(snap.name)
-    removed = 0
+    removed = []
     for snap in snaps:
         if snap.name in keep_set:
             continue
-        size = dir_size(snap.dir)
+        size = freed_bytes(snap.dir)
         if dry_run:
-            print(f"DRY-RUN would remove snapshot {snap.name} ({human_bytes(size)})")
+            if not ctx.json_out:
+                print(f"DRY-RUN would remove snapshot {snap.name} "
+                      f"({human_bytes(size)} freed)")
+            removed.append((snap.name, size))
             continue
-        LOG.info(f"removing old snapshot {snap.name} ({human_bytes(size)})")
+        LOG.info(f"removing old snapshot {snap.name} "
+                 f"({human_bytes(size)} freed)")
         remove_quietly(snap.dir)
-        removed += 1
+        removed.append((snap.name, size))
     return removed
 
 
@@ -4409,8 +4694,9 @@ def cmd_list(ctx, args):
 
 def cmd_gc(ctx, args):
     keep = args.keep if args.keep is not None else ctx.keep_snapshots
-    n = gc_snapshots(ctx, keep, args.dry_run)
+    removed = gc_snapshots(ctx, keep, args.dry_run)
     staged = 0
+    staged_names = []
     base = ctx.store.staging
     if os.path.isdir(base):
         for dbname in os.listdir(base):
@@ -4419,7 +4705,9 @@ def cmd_gc(ctx, args):
                 continue
             for rev in os.listdir(dbdir):
                 if args.dry_run:
-                    print(f"DRY-RUN would remove staging {dbname}/{rev}")
+                    if not ctx.json_out:
+                        print(f"DRY-RUN would remove staging {dbname}/{rev}")
+                    staged_names.append(f"{dbname}/{rev}")
                     continue
                 remove_quietly(os.path.join(dbdir, rev))
                 staged += 1
@@ -4428,7 +4716,17 @@ def cmd_gc(ctx, args):
                     os.rmdir(dbdir)
                 except OSError:
                     pass
-    LOG.info(f"gc: removed {n} snapshot(s), {staged} staging director(ies)")
+    if ctx.json_out:
+        print(json.dumps(
+            {"dry_run": bool(args.dry_run),
+             "snapshots": [{"name": n, "freed_bytes": b}
+                           for n, b in removed],
+             "staging": staged_names,
+             "freed_bytes": sum(b for _n, b in removed)},
+            indent=2, sort_keys=True))
+        return EXIT_OK
+    LOG.info(f"gc: removed {len(removed)} snapshot(s), {staged} staging "
+             f"director(ies)")
     return EXIT_OK
 
 
@@ -4681,7 +4979,11 @@ def cmd_config(ctx, args):
             raise BlastError(f"{path} already exists; pass --force to overwrite "
                              f"it, or --template to print one instead")
         if ctx.dry_run:
-            print(f"DRY-RUN would write the configuration template to {path}")
+            emit_dry_run(ctx,
+                         {"dry_run": True, "would_write": path,
+                          "template": render_config_template()},
+                         [f"DRY-RUN would write the configuration template to "
+                          f"{path}"])
             return EXIT_OK
         atomic_write_text(path, render_config_template())
         LOG.info(f"wrote configuration template to {path}")
@@ -5201,6 +5503,14 @@ def main(argv=None):
     argv = list(sys.argv[1:]) if argv is None else list(argv)
     parser = build_parser()
     args = parser.parse_args(argv)
+    # `~` and `$VARS` reach us unexpanded from a config file (or from a quoted
+    # shell argument); expand every path-valued option once, before anything
+    # uses it - including the config search under `--root`
+    for name in ("root", "config", "log_file", "ncbi_dir", "aria2c", "dir",
+                 "path"):
+        setattr(args, name, expand_path(getattr(args, name, None)))
+    if getattr(args, "adopt", None):
+        args.adopt = [expand_path(p) for p in args.adopt if p]
     # `-v` before and after the sub-command end up in different namespaces; take
     # whichever count is higher so `-v` always means "one more level"
     spelled = sum(argv.count(flag) for flag in ("-v", "--verbose"))
@@ -5233,6 +5543,21 @@ def main(argv=None):
             with RootLock(ctx.root):
                 return args.func(ctx, args)
         return args.func(ctx, args)
+    except BrokenPipeError:
+        # `list --json | jq …` (or `| head`) closes our stdout early.  That is a
+        # normal way to consume output, not a failure: point stdout at devnull
+        # so the interpreter's final flush cannot raise again, and exit 0.
+        try:
+            os.dup2(os.open(os.devnull, os.O_WRONLY), sys.stdout.fileno())
+        except OSError:
+            pass
+        return EXIT_OK
+    except OSError as exc:
+        LOG.error(describe_oserror(exc))
+        if LOG.level >= 2:
+            import traceback
+            LOG.error(traceback.format_exc())
+        return EXIT_ERR
     except VerificationError as exc:
         LOG.error(str(exc))
         return EXIT_VERIFY

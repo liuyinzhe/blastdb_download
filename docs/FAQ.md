@@ -343,6 +343,31 @@ blastn -db nt -query q.fa -out out.txt
 - `blastdb_download.py verify` → 每个库的 `rev` 与**内嵌构建时间**（例如 `build 2026-07-21T05:36`）；
 - 状态文件里有逐库的 `source_snapshot` / `last_updated` / 每个文件的证明来源。
 
+### F7. 工具说 `nt-nucl-metadata.json` 来自另一个构建，这就是下载坏了吗？
+
+先分清两种情形，只有第二种才是你的数据有问题。
+
+**情形一：上游的汇总字段与载荷不一致（常见，1.4.3 起只告警）**。`<db>-nucl-metadata.json` 与
+清单的汇总字段（`last-updated` / `bytes-total`）偶尔与它们自己带来的载荷对不上。实测
+`2026-07-21-01-05-02` 快照：`nt-nucl-metadata.json` 与清单都写着 `2026-07-20` /
+`1063128812728`，而载荷自洽地是 `2026-07-19`（`nt.njs` 与 345 个卷的 `.nin` 内嵌指纹）/
+`1074151309400` 字节，磁盘实测 1074151365765；**文件名单三方一致**（`3112 = 载荷 + nt.njs`），
+只差汇总字段。1.4.3 起这种声明会被降级为告警，日志里带 `stale, ignored`，安装照常进行。
+
+**情形二：工具拒绝安装（`refusing to install`）**。这说明文件清单与体积是在**同构建**前提下
+不符——真问题（缺文件、多文件、被截断），按 D 组处理：重跑 `download`（已证明的文件会直接复用，
+不会重下）或 `repair`。
+
+自己核一下两份权威：
+
+```bash
+blastdb_download.py -r /data/db inspect nt      # 卷内嵌构建时间 / 卷号 / 磁盘实际字节
+blastdb_download.py -r /data/db verify nt       # 逐文件 md5（离线，依据状态文件）
+```
+
+需要提醒的是：`blastdbcmd -db nt -info` 显示的库大小取自那份 json（可能是旧的），
+`inspect` 报告的是磁盘上的真实字节数。两者不一致本身不是错误。
+
 ---
 
 ## G. 运维、迁移与回滚

@@ -47,13 +47,32 @@ DbTarget    : dbname, dbtype, source_key, snapshot_id, files[], archives[],
 | 卷序完整性 | 文件名卷号 + `.nin/.pin` 内嵌卷号，必须 `0..N-1` 连续且一致 | 缺卷、错位、少下了一卷 | `verify_table` |
 | 同一次构建 | 所有卷内嵌构建时间戳必须**完全一致** | 跨卷混装（最危险的一类） | `verify_table` |
 | 库自述一致性 | `<db>.njs` 的 `last-updated` / `number-of-volumes` 与卷指纹一致 | 半更新、清单与内容错配 | `verify_table` |
-| 载荷清单与体积 | `<db>-<type>-metadata.json` 的 `files` / `bytes-total` / `number-of-volumes` / `last-updated` | 缺文件、多文件、被截断、元数据与载荷不同构建 | `check_database_metadata` |
+| 载荷清单与体积 | `<db>-<type>-metadata.json` 的 `files` / `bytes-total` / `number-of-volumes` / `last-updated`，**但仅当它自称的构建日期与卷指纹一致时才作数** | 缺文件、多文件、被截断（同构建）；上游发了旧副本时只告警 | `check_database_metadata` |
+| 组装后的快照 | 与安装前刚校验过的文件**同一 inode + size + mtime**（`file_identity()`）；否则退化为重算 md5 | 快照里装错对象、跨设备复制、两道门之间被写入或替换 | `verify_table(..., proven=…)` |
 | 载荷归属 | 文件名必须属于该库（`belongs_to_database`），共享 taxonomy 除外 | CDN 返错对象、清单被截断、归档没解出来 | `verify_table` |
 | 各卷文件种类一致 | 各卷扩展名集合必须一致（最低卷可多带共享 blob） | 某一卷少了 `.nsq` 之类 | `check_payload_uniformity` |
 | 共享载荷冲突 | 同名不同内容时：有独立 `taxdb` 用它，否则按构建时间取新 | 隐式"后解压覆盖先解压" | `merge_tables` |
 
 **明确的取舍**：没有 md5 的文件（目前只有 NCBI 的 `<db>-<type>-metadata.json`，~500 B）
 不参与任何复用，只重新下载。理由见 §3 第二行。
+
+**它的汇总字段也可能与载荷不一致（唯一会这样的一方）**：实测 `2026-07-21-01-05-02` 快照里，
+清单 `blastdb-metadata-1-1.json` 的 `nt` 条目与快照内的 `nt-nucl-metadata.json` 都自称
+`2026-07-20` / `1063128812728` 字节，而载荷自身——345 个卷的 `.nin` 内嵌指纹、`nt.njs`
+（`2026-07-19T03:10:00` / `1074151309400`）与逐文件 md5（磁盘实测 1074151365765）——说的是
+`2026-07-19` 那一版；三方的**文件名单一致**（`3112 = 载荷 + nt.njs`），差的只有汇总字段
+（一天 / 约 10.2 GB）。所以 `check_database_metadata` 先用日期做判别：日期一致才把它的清单/体积当权威
+（不符即致命，用于离线抓缺文件与截断）；日期不一致就把它的声明降级为告警（`stale, ignored`），
+集合完整性改由卷号连续性与逐文件 md5 保证。
+不要把这个判别扩大化——`.njs`、`.nin` 与逐文件 md5 是载荷自身的证据，它们的检查始终是致命的。
+
+**“同一 inode”也是一种证明（1.4.5）**：安装前那道门把 staging 里的每个载荷文件整读过一遍，
+组装只是给它加一个硬链接，所以快照里的条目与刚校验过的是**同一个 inode**。
+`file_identity()` 用 `(st_dev, st_ino, st_size, st_mtime_ns)` 表达这一点：`link()` 不动 `mtime`，
+而任何写入都会动，因此“能证同 inode”与“重算 md5”等强，直接省掉一遍 1 TiB 读。
+注意别退回 `(dev, ino, size)`——**inode 号会被回收**，删掉重建同大小的文件会骗过它
+（`TestLinkIdentity` 钉住了这一点）。前提是文档里的并发契约：一个 root 只有一个写者（root 锁），
+两道门之间 staging 不会被改。
 
 ---
 
@@ -78,7 +97,7 @@ DbTarget    : dbname, dbtype, source_key, snapshot_id, files[], archives[],
 
 ```jsonc
 {
-  "tool": "blastdb_download.py", "tool_version": "1.4.0", "format": 1,
+  "tool": "blastdb_download.py", "tool_version": "1.4.7", "format": 1,
   "created": "2026-09-24T03:00:00Z", "source": "gcp",
   "source_snapshot": "2026-07-21-01-05-02", "snapshot": "gcp-2026-07-21-01-05-02-cc41a566",
   "previous": "…", "build_date": "2026-07-21", "tree_fingerprint": "…", "content_hash": "…",

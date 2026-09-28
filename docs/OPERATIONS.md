@@ -40,7 +40,9 @@ built in: python standard library only …       ← 依赖确认：无 pip 包�
 
 - `--keep-archives` 会把峰值变成 **载荷 + 全部归档**（`nt` ≈ 1.9 TiB）。
 - 时间：实测 8 并发约 60 MiB/s（视线路而定），1 TiB ≈ 4.6 小时；解压额外占 CPU（`nt` 约十几分钟）。
-- 快照之间用硬链接共享，日常增量只多占"真正变动的文件"；`--keep-snapshots` 控制保留数（默认 2）。
+- 快照之间用硬链接共享，日常增量只多占“真正变动的文件”；`--keep-snapshots` 控制保留数（默认 2）。
+  因此 1.4.6 起 `gc` 报的释放量按 `st_nlink == 1` 统计：删一个只改了少数卷的旧快照，真正释放的
+  可能就是那几卷（以前会把共享部分也报进去，虚高）。
 
 ---
 
@@ -107,19 +109,35 @@ tail -f /var/log/blastdb/nt.log
 一条健康日志长这样：
 
 ```
-… ---- blastdb_download.py 1.4.0 started: -r … -s gcp -j 8 … download nt taxdb
+… ---- blastdb_download.py <版本> started: -r … -s gcp -j 8 … download nt taxdb
 … source: gcp:2026-07-21-01-05-02
 … also fetching taxdb (62.34 MiB) so taxonomy lookups work; use --no-taxdb to skip it
 … nt: fetching 3113 file(s) (1.00 TiB) with aria2c, 8 parallel
 … [  1/3113] nt.000.nhd  26.0 MiB in 1s (25.3 MiB/s)
 … nt:  12.4% 124.3 GiB/1,000.38 GiB 61.14 MiB/s files 45/3113 eta 4h05m
+… nt: set-level verification: hashing 3113 file(s), 0.98 TiB with md5 (ETA ~1h 08m)
+… nt: set-level verification: hashed 3113 file(s), 0.98 TiB in 1h 07m (255.31 MiB/s)
 … assembling snapshot gcp-2026-07-21-01-05-02-1a2b3c4d (… files, 4 database(s))
+… nt: final verification: 3113 file(s) proven by link identity, nothing re-read
 … installed gcp-…; /data/public/databases/current -> gcp-…
 … ---- finished
 ```
 
 要看的关键行：`source:`（本次钉住的快照）、`fetching`（计划量）、`[i/N]`（逐文件）、
 `installed`（原子切换完成）、`finished`。
+
+> **关于那段巨安静的校验（1.4.4 起有开始/结束行）**：安装前每个库要**整读一遍载荷算 md5**
+> （`set-level verification`）——这是**真正读盘**的那一遍；两行之间除了按 `--progress-interval`
+> 的下载进度外**没有任何输出**，`nt`（1.07 TB）在 250 MB/s 的盘上就是约 1 小时。开始行里的
+> `ETA ~…` 用首个文件的实测速率外推。
+>
+> 组装完成后的那道 `final verification` **从 1.4.5 起不再重读**：快照里的文件是刚校验过的那些
+> inode 的硬链接，**同一 inode + 同 size + 同 mtime** 等价于重算 md5，所以它只打一行
+> `N file(s) proven by link identity, nothing re-read`。证明不了的文件（跨设备复制、装前被改动
+> 或被替换、身份记录过期）会回退成真的算 md5，那时照旧打 `hashing … / hashed …` 两行。
+>
+> 中途被中断再重跑还会多一遍：staging 复用扫描对每个已下文件算 md5（每文件一行
+> `… was already fetched by an earlier run and still verifies`）。
 
 **离线巡检脚本**（不需要网络，适合每天跑）：
 
@@ -148,6 +166,8 @@ EOF
 | `md5 mismatch` / `size mismatch` | 传输被撕裂/损坏 | 工具已删坏文件并重试；反复出现则降并发、检查线路与代理 |
 | `host name resolution failed` / `TLS certificate problem` | 网络/代理 | 检查 `HTTPS_PROXY`；自建镜像调试可临时 `--insecure` |
 | `MIXED BUILD TIMESTAMPS` | 本地/远端集合前后不一致 | 工具**已拒绝安装**；重跑（会重新拉取）；若来自手工目录，用 `inspect` 定位 |
+| `describes a different build`（带 `stale, ignored`） | `-metadata.json` 自称的构建日期与卷内嵌指纹不符：上游把上一次构建的副本发进了快照（`nt` 在 `2026-07-21-01-05-02` 就是如此） | **无需动作**，安装会照常完成（1.4.3 起）；想确认就先 `inspect <db>`，看卷内嵌指纹与磁盘实际字节数是否自洽（FAQ F7、`../README.md` 附录 A.4） |
+| `bytes-total ... != the ... bytes of payload on disk`、`lists N file(s) that are absent` | 同构建下 metadata 与载荷不符：真缺文件或被截断 | 工具**已拒绍安装**；直接重跑 `download`（已证明的文件会全部复用）或 `repair`；手工目录用 `inspect` 定位到具体文件 |
 | `the source published a new revision` | 下载期间官网发版 | `--on-torn retry`（默认）会等待重试；`fail` 则退出码 4 |
 | `transfer stopped: only X of usable space left` | 空间看门狗触发 | 已下内容全部保留；腾空间后重跑续传 |
 | `another blastdb_download.py run is already using this mirror` | 并发写 | 等它结束；或用 `list`/`verify` 等只读命令 |

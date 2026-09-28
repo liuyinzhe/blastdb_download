@@ -1256,6 +1256,225 @@ class TestAdoptExisting(Case):
         self.assertIn("not a directory", proc.stderr)
 
 
+class TestPathAndPipeHandling(Case):
+    """Two CLI-level robustness gaps found in the 1.4.7 review.
+
+    * a closed stdout (`--json | jq`, `| head`) used to be reported as
+      `unexpected BrokenPipeError` with exit 1, i.e. a working pipeline looked
+      like a failed run;
+    * `-r ~/db` (and `root = "~/db"` in a config file) created a directory
+      literally named `~`, because `os.path.abspath` does not expand it.
+    """
+
+    def many_snapshots(self, count=1200):
+        import blastdb_download as bd
+        for i in range(count):
+            d = os.path.join(self.root, f"ncbi-2026-01-01T{i // 60:02d}-{i:08x}")
+            os.makedirs(d, exist_ok=True)
+            with open(os.path.join(d, bd.STATE_BASENAME), "w") as fh:
+                json.dump({"tool": bd.PROGRAM, "format": 1,
+                           "created": f"2026-01-01T{i // 60:02d}:{i % 60:02d}:00Z",
+                           "source": "ncbi", "dbs": {},
+                           "tree_fingerprint": f"{i:08x}"}, fh)
+
+    def test_a_closed_pipe_is_not_a_failure(self):
+        self.many_snapshots()
+        proc = self.run_cli_async("list", "--json")
+        try:
+            self.assertTrue(proc.stdout.read(32))       # a big JSON document
+            proc.stdout.close()                         # ... then stop reading
+            code = proc.wait(timeout=120)
+            err = proc.stderr.read()
+        finally:
+            proc.stderr.close()
+        self.assertEqual(code, 0, err)
+        self.assertNotIn("BrokenPipe", err)
+
+    def test_a_tilde_in_an_option_is_expanded(self):
+        import blastdb_download as bd
+        home = os.path.join(self.root, "home")
+        os.makedirs(home, exist_ok=True)
+        self.assertEqual(bd.expand_path("~/db"),
+                         os.path.expanduser("~/db"))
+        proc = self.run_cli("-r", "~/mini", "config",
+                            env={"HOME": home}, expect=0)
+        self.assertIn(os.path.join(home, "mini"), proc.stdout)
+        self.assertFalse(os.path.exists(os.path.join(os.getcwd(), "~")))
+
+    def test_a_filesystem_error_is_named_the_way_the_playbook_lists_it(self):
+        import errno as errno_mod
+        import blastdb_download as bd
+        full = OSError(errno_mod.ENOSPC, "No space left on device",
+                       "/data/db/x")
+        self.assertIn("no space left on the filesystem", bd.describe_oserror(full))
+        self.assertIn("/data/db/x", bd.describe_oserror(full))
+        self.assertIn("quota exceeded",
+                      bd.describe_oserror(OSError(errno_mod.EDQUOT, "x")))
+        self.assertIn("read-only",
+                      bd.describe_oserror(OSError(errno_mod.EROFS, "x")))
+        self.assertIn("strange", bd.describe_oserror(OSError(9999, "strange")))
+
+    def test_a_tilde_in_the_config_file_is_expanded(self):
+        home = os.path.join(self.root, "home")
+        os.makedirs(home, exist_ok=True)
+        path = os.path.join(self.root, "c.toml")
+        with open(path, "w") as fh:
+            fh.write('root = "~/from-config"\n')
+        # drop the base `-r` so the config file decides the root
+        base = [a for a in self.cli_args() if a not in ("-r", self.root)]
+        proc = subprocess.run(base + ["--config", path, "config"],
+                              capture_output=True, text=True, timeout=120,
+                              env={**os.environ, "HOME": home}, check=False)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn(os.path.join(home, "from-config"), proc.stdout)
+
+
+class TestLinkIdentity(Case):
+    """The final gate proves a hard-linked payload by inode, not by re-reading.
+
+    Reading a terabyte twice was the largest avoidable cost of a large install
+    (see CHANGELOG 1.4.5).  Proving that the snapshot file *is* the inode the
+    set-level gate hashed is the same statement; anything else - a copy, a
+    replaced file, a stale record - falls back to hashing.
+    """
+
+    def setUp(self):
+        super().setUp()
+        import blastdb_download as bd
+        self.addCleanup(setattr, bd.LOG, "quiet", bd.LOG.quiet)
+        bd.LOG.quiet = True
+        self.bd = bd
+
+    def write(self, name, data=b"payload-of-a-blast-database" * 100):
+        path = os.path.join(self.root, name)
+        with open(path, "wb") as fh:
+            fh.write(data)
+        return path
+
+    def entry(self, name, path):
+        return {name: (path, {"size": os.path.getsize(path),
+                              "md5": self.bd.md5_file(path)})}
+
+    def md5_issues(self, issues):
+        return [m for m in issues if "md5" in m]
+
+    def test_a_hard_link_is_proven_without_reading_it(self):
+        source = self.write("staged.nsq")
+        link = os.path.join(self.root, "snapshot.nsq")
+        os.link(source, link)                   # exactly what the assembly does
+        proven = self.bd.verified_identities(self.entry("db.nsq", source))
+        issues, info = self.bd.verify_table("db", self.entry("db.nsq", link),
+                                            proven=proven)
+        self.assertEqual(info["md5"], {"hashed": 0, "proven": 1})
+        self.assertEqual(self.md5_issues(issues), [])
+
+    def test_a_replaced_file_is_hashed_again_and_caught(self):
+        data = b"payload-of-a-blast-database" * 100
+        source = self.write("staged.nsq", data)
+        original = self.entry("db.nsq", source)     # records the good checksum
+        proven = self.bd.verified_identities(original)
+        os.unlink(source)                            # a new inode ...
+        replaced = self.write("staged.nsq", b"!" * len(data))
+        later = time.time() + 10                     # ... and other bytes
+        os.utime(replaced, (later, later))
+        issues, info = self.bd.verify_table("db", original, proven=proven)
+        self.assertEqual(info["md5"], {"hashed": 1, "proven": 0})
+        self.assertTrue(self.md5_issues(issues), issues)
+
+    def test_a_copy_is_hashed_again_and_accepted(self):
+        # cross-device fallback of `link_or_copy`: same bytes, other inode
+        source = self.write("staged.nsq")
+        proven = self.bd.verified_identities(self.entry("db.nsq", source))
+        copy = os.path.join(self.root, "copied.nsq")
+        shutil.copy2(source, copy)
+        issues, info = self.bd.verify_table("db", self.entry("db.nsq", copy),
+                                            proven=proven)
+        self.assertEqual(info["md5"], {"hashed": 1, "proven": 0})
+        self.assertEqual(self.md5_issues(issues), [])
+
+    def test_a_file_without_a_checksum_is_never_counted(self):
+        path = self.bd.verified_identities({})
+        self.assertEqual(path, {})
+        _, info = self.bd.verify_table(
+            "db", {"db-nucl-metadata.json": (self.write("db-nucl-metadata.json",
+                                                         b"{}"), {"size": 2})})
+        self.assertEqual(info["md5"], {"hashed": 0, "proven": 0})
+
+
+class TestVerifyReporting(Case):
+    """The full-payload md5 pass logs exactly two lines: start (with an ETA)
+    and end.
+
+    Measured problem: a 1 TiB `nt` install spends hours in this pass without a
+    single line, which is indistinguishable from a hang.  Per-file output is not
+    an option (thousands of lines), so the pass reports only its boundaries.
+    """
+
+    MARKERS = ("verification: hashing", "verification: hashed",
+               "proven by link identity")
+
+    def pass_lines(self, text):
+        return [ln for ln in text.splitlines()
+                if any(m in ln for m in self.MARKERS)]
+
+    def test_a_download_reports_each_pass_start_and_end(self):
+        # a download hashes the payload once (the set-level gate) and then
+        # proves the assembled snapshot by link identity instead of re-reading
+        self.fake.add("testdb", make_revision())
+        proc = self.run_cli("download", "testdb", expect=0)
+        lines = self.pass_lines(proc.stderr)
+        self.assertEqual(len(lines), 3, proc.stderr)
+        self.assertIn("set-level verification: hashing", lines[0])
+        self.assertIn("set-level verification: hashed", lines[1])
+        self.assertIn("final verification", lines[2])
+        self.assertIn("proven by link identity", lines[2])
+        self.assertIn("nothing re-read", lines[2])
+        self.assertRegex(lines[0], r"ETA ~\d+[hms]")
+        self.assertIn("with md5", lines[0])
+        self.assertNotIn("checksum mismatch", lines[1] + lines[2])
+
+    def test_the_start_line_states_what_will_be_read(self):
+        self.fake.add("testdb", make_revision())
+        proc = self.run_cli("download", "testdb", expect=0)
+        self.assertRegex(self.pass_lines(proc.stderr)[0],
+                         r"hashing \d+ file\(s\), \d[\d.,]* (B|KiB|MiB|GiB)")
+
+    def test_a_full_verify_reports_it_too(self):
+        self.fake.add("testdb", make_revision())
+        self.run_cli("download", "testdb", expect=0)
+        proc = self.run_cli("verify", expect=0)
+        lines = self.pass_lines(proc.stderr)
+        self.assertEqual(len(lines), 2, proc.stderr)
+        self.assertIn("set-level verification: hashing", lines[0])
+
+    def test_a_quick_verify_does_not_claim_to_hash_anything(self):
+        self.fake.add("testdb", make_revision())
+        self.run_cli("download", "testdb", expect=0)
+        proc = self.run_cli("verify", "--quick", expect=0)
+        self.assertEqual(self.pass_lines(proc.stderr), [], proc.stderr)
+
+    def test_a_mismatch_is_counted_in_the_closing_line(self):
+        self.fake.add("testdb", make_revision())
+        self.run_cli("download", "testdb", expect=0)
+        path = os.path.join(self.root, self.current(), "testdb.nsq")
+        size = os.path.getsize(path)
+        with open(path, "r+b") as fh:              # same size, different bytes
+            fh.seek(size // 2)
+            fh.write(b"\x00")
+        proc = self.run_cli("verify", expect=3)
+        lines = self.pass_lines(proc.stderr)
+        self.assertEqual(len(lines), 2, proc.stderr)
+        self.assertIn("checksum mismatch", lines[1])
+
+    def test_the_pass_is_not_printed_once_per_file(self):
+        # eight volumes => 8 volume indexes, and still exactly two lines
+        dates = ("Jul 01, 2026  1:00 AM",) * 8      # eight volumes, one build
+        self.fake.add("testdb", make_revision(dates=dates))
+        proc = self.run_cli("download", "testdb", expect=0)
+        # eight volumes: two lines for the set-level pass, one for the final one
+        self.assertEqual(len(self.pass_lines(proc.stderr)), 3, proc.stderr)
+
+
 class TestStaleUpstreamMetadata(Case):
     """NCBI publishes stale per-database metadata JSONs in real snapshots.
 
@@ -1297,6 +1516,20 @@ class TestStaleUpstreamMetadata(Case):
         proc = self.run_cli("download", "testdb", expect=3)
         self.assertIn("bytes-total 12345", proc.stderr)
         self.assertNotIn("stale, ignored", proc.stderr)
+
+    def test_metadata_listing_a_shared_taxonomy_file_is_not_a_missing_file(self):
+        # The cross-check drops shared taxonomy files from what it looks for on
+        # disk, so it has to drop them from what the metadata lists as well:
+        # a cloud snapshot's payload-level metadata lists members, and a DB that
+        # ships the shared taxonomy files would otherwise be refused.
+        rev = make_revision()
+        key = "testdb-nucl-metadata.json"
+        meta = json.loads(rev["extra_objects"][key])
+        meta["files"] = sorted(set(meta["files"]) | {"taxonomy4blast.sqlite3"})
+        rev["extra_objects"][key] = json.dumps(meta, indent=2).encode()
+        self.fake.add("testdb", rev)
+        proc = self.run_cli("download", "testdb", expect=0)
+        self.assertNotIn("absent", proc.stderr)
 
     def test_inspect_reports_it_as_a_warning_not_a_failure(self):
         tree = os.path.join(self.root, "tree")
@@ -1909,6 +2142,36 @@ class TestSnapshots(Case):
         self.assertLessEqual(len(self.snapshots()), 2)
         self.assertTrue(os.path.islink(os.path.join(self.root, "current")))
 
+    def test_gc_reports_only_the_bytes_it_actually_frees(self):
+        # what a snapshot shares with its successor costs nothing to delete,
+        # so `gc` must not promise the tree size back
+        import blastdb_download as bd
+        self.fake.add("testdb", make_revision())
+        self.run_cli("download", "testdb", expect=0)
+        old = self.current()
+        # the next install keeps testdb (and hard-links its files)
+        self.fake.add("otherdb", make_revision(dbname="otherdb"))
+        self.run_cli("download", "otherdb", expect=0)
+        self.assertNotEqual(self.current(), old)
+        shared = exclusive = 0
+        for name in os.listdir(os.path.join(self.root, old)):
+            path = os.path.join(self.root, old, name)
+            if not os.path.isfile(path):
+                continue
+            st = os.stat(path)
+            if st.st_nlink > 1:
+                shared += st.st_size
+            else:
+                exclusive += st.st_size
+        self.assertGreater(shared, 0, "testdb should be shared with the new one")
+        self.assertNotEqual(bd.human_bytes(exclusive),
+                            bd.human_bytes(exclusive + shared))
+        proc = self.run_cli("gc", "--keep", "1", expect=0)
+        self.assertIn(f"{bd.human_bytes(exclusive)} freed", proc.stderr)
+        self.assertNotIn(f"{bd.human_bytes(exclusive + shared)} freed",
+                         proc.stderr)
+        self.assertFalse(os.path.exists(os.path.join(self.root, old)))
+
     def test_list_json(self):
         self.fake.add("testdb", make_revision())
         self.run_cli("-q", "download", "testdb", expect=0)
@@ -2008,6 +2271,25 @@ class TestCliContract(Case):
         self.assertIn("testdb", proc.stdout)
         self.run_cli("list", "--json", expect=0)
         self.run_cli("gc", "--dry-run", "--keep", "3", expect=0)
+
+    def test_a_dry_run_json_is_the_only_thing_on_stdout(self):
+        # `--json` promises stdout carries the document and nothing else, and a
+        # dry run is exactly the case a script pipes into `jq` to preview a plan
+        self.fake.add("testdb", make_revision())
+        data = json.loads(self.run_cli("--json", "download", "--dry-run",
+                                       "testdb", expect=0).stdout)
+        self.assertTrue(data["dry_run"])
+        self.assertIn("testdb", data["databases"])
+        self.assertEqual(data["need_fetching"], ["testdb"])
+
+    def test_a_gc_dry_run_json_is_valid(self):
+        self.fake.add("testdb", make_revision())
+        self.run_cli("download", "testdb", expect=0)
+        data = json.loads(self.run_cli("--json", "gc", "--dry-run",
+                                       expect=0).stdout)
+        self.assertTrue(data["dry_run"])
+        self.assertIn("snapshots", data)
+        self.assertIn("freed_bytes", data)
 
     def test_a_misplaced_subcommand_option_names_its_owner(self):
         # --force is a download option: argparse alone would only say

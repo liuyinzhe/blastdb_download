@@ -194,7 +194,8 @@ u32 version(5) | u32 dbtype(0=核酸,1=蛋白) | u32 卷序号 | 标题 | 卷基
 | `nr.000.pin` / `nr.001.pin` | 0 / 1 | 全部 `Jul 14, 2026 12:42 AM` |
 
 并且 `nt.njs` 里的 `"last-updated": "2026-07-19T03:10:00"` 与之严格一致；
-`<db>-nucl-metadata.json` 里的 `last-updated` 也一致（日期级）。
+`<db>-nucl-metadata.json` 里的 `last-updated` 也一致（日期级）——但那是抽查的库，`nt` 在
+`2026-07-21-01-05-02` 快照里恰好相反（那份 json 落后一天），见 §4.4。
 
 > **推论**：两个卷属于同一次构建 ⇔ 它们的内嵌构建时间戳相同。
 > 这个判断完全在本地完成，不需要联网，也不依赖任何一方元数据的自述。
@@ -302,9 +303,10 @@ nt  (/data/public/databases/NT)
 ```
 
 它同时能发现：缺卷（卷序号不连续）、文件名卷号与内嵌卷号不符、缺少/多余载荷文件、
-载荷文件被截断、载荷与其 metadata 来自不同构建。
+载荷文件被截断、同一构建内载荷与其 metadata 不一致。（若 metadata 自称的构建日期与卷指纹
+不同，按 §4.4 只作告警——上游可能发的是旧副本。）
 
-### 4.4 完整性交叉检查：`<db>-nucl-metadata.json`（实测可用）
+### 4.4 完整性交叉检查：`<db>-nucl-metadata.json`（同构建时可用；上游可能发旧副本）
 
 镜像里与数据并排放着 `<db>-nucl-metadata.json`，其中 `files` 列表、`number-of-volumes`、
 `bytes-total` 三项与磁盘上的载荷**完全吻合**（实测 `16S_ribosomal_RNA`：
@@ -318,15 +320,37 @@ nt  (/data/public/databases/NT)
 jq -r '.files[], ."bytes-total", ."last-updated"' 16S_ribosomal_RNA-nucl-metadata.json
 ```
 
-`blastdb_download.py` 的 `inspect` / `verify` 已经内置了这三项检查（缺文件、多文件、
-字节数不符、时间戳与卷指纹不一致都会报错）。实测四种破坏方式都能被抓出来：
+**但它的汇总字段可能与它自己带来的载荷对不上**——它不是快照的权威，载荷自身的证据才是。
+实测 `2026-07-21-01-05-02` 快照（2026-09-28 复核；`nt` 共 345 卷、1.07 TiB）：
+
+| 来源 | `last-updated` | `bytes-total` | 文件名单 |
+|---|---|---|---|
+| 清单 `blastdb-metadata-1-1.json` 的 `nt` 汇总字段 | 2026-07-20T00:00:00 | 1063128812728 | 3112 |
+| 快照内 `nt-nucl-metadata.json` | 2026-07-20T00:00:00 | 1063128812728 | 3112（与清单逐名一致） |
+| 载荷 `nt.njs` | 2026-07-19T03:10:00 | 1074151309400 | 3111（不含自身） |
+| 345 个卷的 `.nin` 内嵌指纹 | `Jul 19, 2026  3:10 AM` | — | — |
+| 磁盘载荷实测（逐文件 md5 全部通过） | — | 1074151365765 | 3112 |
+
+**文件名单三方一致**（`3112 = 载荷 + nt.njs`），差的只有汇总字段：日期一天、字节约 10.2 GB。
+即：**载荷自洽，异口的是汇总字段**——不要据此判断“我的数据是旧版”，也不要拿 `bytes-total` 判完整性。
+因此 1.4.3 起 `blastdb_download.py` 的判别是**先看它自称的构建日期是否与卷内嵌指纹一致**：
+
+- **一致**：它才是权威，`files` / `bytes-total` / `number-of-volumes` 不符一律**拒绝安装**（下表前四行）；
+- **不一致**：把它的声明降级为**告警**（日志里写 `stale, ignored`），安装照常进行；集合完整性改由
+  卷号 `0..N-1` 连续性、逐文件 md5 与 `.njs` 保证——真缺一卷仍会被拦住。
+
+手工复核时请照这个顺序：先 `blastdb_download.py inspect <db>`（卷内嵌指纹 + 磁盘实际字节数），
+再拿 json 去比。注意 `blastdbcmd -db <db> -info` 报的库大小取自那份 json，可能是旧的。
+
+`blastdb_download.py` 的 `inspect` / `verify` 已经内置了上述检查。实测四种破坏方式都能被抓出来：
 
 | 破坏方式 | `inspect` 的判定 |
 |---|---|
-| 把 `.nin` 换成另一版本 | `last-updated` 与卷指纹日期不一致 → FAILED（并顺便报出字节数不符） |
+| 把某个卷的 `.nin` 换成另一版本 | 卷间内嵌时间戳不一致（`MIXED BUILD TIMESTAMPS`）→ FAILED |
 | 删掉 `.nsq` | `lists 1 file(s) that are absent: ...` → FAILED |
 | 把 `.nsq` 截断一半 | `bytes-total 18427887 != the 13356971 bytes of payload on disk` → FAILED |
 | 多放一个杂文件 | `does not list 1 file(s) that are present: ...` → FAILED |
+| 上游把旧副本塞进快照（`nt` 实测） | `describes a different build ... (stale, ignored)` → 告警，verdict 仍 OK |
 
 ### 4.5 推荐的检查组合
 
@@ -368,7 +392,7 @@ blastn -db nt -query q.fa -out out.txt
 | 卷之间混版（3.1） | 下载前记下 `revkey`，下载后再读一次；变了就丢弃重试或中止（**绝不安装**）。安装前再校验所有卷的内嵌构建时间戳一致、卷序号 `0..N-1` 连续 |
 | 选错云端快照（3.2） | 只用 `latest-dir`，并要求目标快照的 manifest 存在、清单里每个文件都在快照里 |
 | 单文件损坏 | 权威 md5：NCBI 用 `.md5` 边车，GCS 用 `md5Hash`；aria2c 模式下用 `checksum=md5=` 在下载内校验，失败文件被删除 |
-| 缺文件/多文件/截断（4.4） | `<db>-nucl-metadata.json` 的 `files` 与 `bytes-total` 交叉校验 |
+| 缺文件/多文件/截断（4.4） | `<db>-nucl-metadata.json` 的 `files` 与 `bytes-total` 交叉校验（**仅当它自称的构建日期与卷指纹一致**；不一致则降级为告警，改由卷号连续性与逐文件 md5 兜底） |
 | 更新时读到半套数据 | 新快照目录 + **原子替换 `current` 软链接**；读端永不见半更新，回滚是一次软链接切换 |
 | 中断后重头再来 | 三层续跑：分片状态 → staging 复用 → 快照硬链接；staging 按 `revkey` 隔离，旧断点不可能污染新版本 |
 | 无法判断老目录是否有问题 | `inspect` 直接读 `.nin` 指纹，不用 BLAST、不用状态文件 |

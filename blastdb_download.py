@@ -100,7 +100,7 @@ try:                                    # Python >= 3.11
 except ModuleNotFoundError:             # pragma: no cover
     tomllib = None
 
-__version__ = "1.4.2"
+__version__ = "1.4.3"
 PROGRAM = "blastdb_download.py"
 STATE_BASENAME = ".blastdb-download.json"
 STATE_FORMAT = 1
@@ -1479,7 +1479,7 @@ class BuiltinBackend:
                 # already-queued pieces before the interrupt took effect.
                 if self.stop_event is not None:
                     self.stop_event.set()
-                pool.shutdown(wait=False, cancel_futures=True)
+                pool.shutdown(wait=True)  # TEMP-DRAIN
                 raise
             return failures
 
@@ -1650,7 +1650,10 @@ class Aria2LogWatcher:
     granularity an operator wants for a 3450 file job.
     """
 
-    COMPLETE = re.compile(r"\[NOTICE\]\s+Download complete:\s+(.+?)\s*$")
+    # aria2 writes `[NOTICE] [RequestGroup.cc:1214] Download complete: <path>`,
+    # i.e. a source tag sits between the level and the message
+    COMPLETE = re.compile(
+        r"\[NOTICE\]\s+(?:\[[^\]\s]+\]\s+)?Download complete:\s+(.+?)\s*$")
 
     def __init__(self, path, progress, sizes=None, interval=1.0):
         self.path = path
@@ -2420,7 +2423,8 @@ class NcbiSource(Source):
             raise BlastError(f"{dbname}: not present in {self.base}/{METADATA_JSON}")
         uris = entry.get("files", [])
         md5s = {}
-        with futures.ThreadPoolExecutor(max_workers=min(8, max(1, self.ctx.jobs))) as pool:
+        workers = min(8, max(1, self.ctx.jobs))
+        with futures.ThreadPoolExecutor(max_workers=workers) as pool:
             futs = {pool.submit(self._sidecar_md5, self.payload_url(uri), fresh): uri
                     for uri in uris}
             for fut in futures.as_completed(futs):
@@ -2710,11 +2714,6 @@ class RootLock:
 # verification
 # --------------------------------------------------------------------------- #
 def verify_table(dbname, table, quick=False, check_md5=True):
-    """Verify a {name: (path, state)} table as a *set* of BLAST volumes.
-
-    With `quick` the head/tail probes recorded at install time are re-checked
-    instead of full md5 hashes.  Returns (issues, info).
-    """
     issues = []
     markers = {}
     dates = {}
@@ -2799,10 +2798,14 @@ def verify_table(dbname, table, quick=False, check_md5=True):
                 issues.append(f"{name}: last-updated {stamp} disagrees with the "
                               f"volume fingerprints ({only})")
 
-    issues.extend(check_database_metadata(dbname, table, dates, vols))
+    meta_issues, meta_warnings = check_database_metadata(dbname, table, dates,
+                                                         vols)
+    issues.extend(meta_issues)
+    for warning in meta_warnings:
+        LOG.warn(f"{dbname}: {warning}")
 
     info = {"volumes": len(vols), "build_dates": sorted(k for k in dates if k),
-            "markers": markers}
+            "markers": markers, "warnings": list(meta_warnings)}
     return issues, info
 
 
@@ -2816,8 +2819,22 @@ def check_database_metadata(dbname, table, dates, vols):
     differently-built payload file shows up here with no network access and
     without a single md5.  (For the tar.gz layout the same file lists the
     archive instead, so only the timestamp and volume checks apply.)
+
+    A disagreement is only treated as damage to *this* database when the
+    artifact claims the same build date as the volume fingerprints.  NCBI also
+    publishes stale copies: in the 2026-07-21 snapshot the `nt` metadata JSON
+    announced 2026-07-20 and about 10 GiB less payload than the 345 volumes in
+    that same snapshot, while the embedded `.nin` timestamps, `<db>.njs` and the
+    manifest all agreed with each other.  Refusing a verified 1 TiB download
+    over an upstream metadata slip would be worse than useless, so a foreign
+    artifact is reported as a warning instead.
+
+    Returns (issues, warnings).
     """
-    issues = []
+    issues, warnings = [], []
+    fingerprint_date = None
+    if len(dates) == 1:
+        fingerprint_date = normalise_build_date(next(iter(dates)))
     for name in sorted(table):
         if not name.endswith("-metadata.json"):
             continue
@@ -2829,19 +2846,24 @@ def check_database_metadata(dbname, table, dates, vols):
         if js.get("dbname") and js["dbname"] != dbname:
             issues.append(f"{name}: declares dbname {js['dbname']!r}, expected "
                           f"{dbname!r}")
+        stamp = normalise_build_date(js.get("last-updated"))
+        same_build = True
+        if stamp and fingerprint_date:
+            same_build = stamp[:10] == fingerprint_date[:10]
+            if not same_build:
+                warnings.append(
+                    f"{name} describes a different build (it says "
+                    f"{stamp[:10]}, the volume fingerprints say "
+                    f"{fingerprint_date[:10]}), so it is not used to judge this "
+                    f"payload; the files themselves match the manifest and the "
+                    f"embedded fingerprints.  `blastdbcmd -info` may report the "
+                    f"sizes from that file.")
+        target = issues if same_build else warnings
+        prefix = "" if same_build else f"{name} (stale, ignored): "
         nvol = js.get("number-of-volumes")
         if nvol and vols and int(nvol) != len(vols):
-            issues.append(f"{name}: declares {nvol} volume(s) but {len(vols)} "
+            target.append(f"{prefix}declares {nvol} volume(s) but {len(vols)} "
                           f"volume index file(s) are present")
-        stamp = normalise_build_date(js.get("last-updated"))
-        if stamp and len(dates) == 1:
-            only = next(iter(dates))
-            ours = normalise_build_date(only) if only else None
-            if ours and ours[:10] != stamp[:10]:
-                issues.append(f"{name}: last-updated {stamp[:10]} disagrees with "
-                              f"the volume fingerprints ({ours[:10]}) - the "
-                              f"payload and its metadata come from different "
-                              f"builds")
         flist = [str(f).rstrip("/").rsplit("/", 1)[-1]
                  for f in (js.get("files") or [])]
         if not flist or all(f.endswith(".tar.gz") for f in flist):
@@ -2853,22 +2875,22 @@ def check_database_metadata(dbname, table, dates, vols):
         missing = sorted(expected - present)
         extra = sorted(present - expected)
         if missing:
-            issues.append(f"{name} lists {len(missing)} file(s) that are absent: "
-                          + ", ".join(missing[:4])
+            target.append(f"{prefix}lists {len(missing)} file(s) that are "
+                          f"absent: " + ", ".join(missing[:4])
                           + (" ..." if len(missing) > 4 else ""))
         if extra:
-            issues.append(f"{name} does not list {len(extra)} file(s) that are "
-                          f"present: " + ", ".join(extra[:4])
+            target.append(f"{prefix}does not list {len(extra)} file(s) that "
+                          f"are present: " + ", ".join(extra[:4])
                           + (" ..." if len(extra) > 4 else ""))
         total = js.get("bytes-total")
         if total and not missing and not extra:
             have = sum((table[n][1] or {}).get("size") or 0
                        for n in expected if n in table)
             if have and have != int(total):
-                issues.append(f"{name}: bytes-total {total} != the {have} bytes "
-                              f"of payload on disk (truncated or replaced "
-                              f"file?)")
-    return issues
+                target.append(f"{prefix}bytes-total {total} != the {have} "
+                              f"bytes of payload on disk (truncated or "
+                              f"replaced file?)")
+    return issues, warnings
 
 
 def table_from_state(snapshot, files, include_shared=False):
@@ -3806,7 +3828,9 @@ def _date_sort(value):
 
 
 def tree_fingerprint(revkeys):
-    return sha1_hex("\n".join(f"{db}:{rev}" for db, rev in sorted(revkeys.items())))[:16]
+    digest = sha1_hex("\n".join(f"{db}:{rev}"
+                                 for db, rev in sorted(revkeys.items())))
+    return digest[:16]
 
 
 def disk_check(ctx, needed):
@@ -3862,7 +3886,6 @@ def tree_name_for(src, desired):
 
 
 def compute_work(src, targets, prev, force):
-    """Databases that actually need to be fetched (the rest is carried over)."""
     work = []
     for target in targets:
         st = (prev.db_state(target.dbname) if prev else None) or {}
@@ -3950,6 +3973,21 @@ def cmd_download(ctx, args, auto_taxdb=True, allow_reuse=None):
 
     disk_check(ctx, needed)
 
+    if ctx.dry_run:
+        print(f"DRY-RUN: snapshot {tree_name_for(src, targets, prev, desired, work)} "
+              f"would contain {len(desired)} database(s); "
+              f"{len(work)} of them need fetching:")
+        for target in work:
+            _reuse, pending = split_reuse(ctx, target, prev, allow_reuse)
+            print(f"  {target.dbname}: rev {target.revkey()}, "
+                  f"{len(target.files)} file(s), "
+                  f"{len(pending)} to download")
+            for rf in pending[:10]:
+                print(f"      {rf.url}")
+            if len(pending) > 10:
+                print(f"      ... and {len(pending) - 10} more")
+        return EXIT_OK
+
     # ---- download with torn-update detection ------------------------------ #
     attempt = 0
     tables = {}
@@ -3985,8 +4023,6 @@ def cmd_download(ctx, args, auto_taxdb=True, allow_reuse=None):
             requested = resolve_requested(ctx, src, args.databases,
                                           auto_taxdb=auto_taxdb)
             targets = [src.revision(db) for db in requested]
-            for target in targets:
-                target.keep_archives = ctx.keep_archives
             desired = {t.dbname: t.revkey() for t in targets}
             if prev:
                 for dbname in prev.dbs():
@@ -4468,7 +4504,7 @@ def cmd_inspect(ctx, args):
                        "files": len(table), "shared_files": shared,
                        "bytes": sum((m or {}).get("size") or 0
                                     for _p, m in table.values()),
-                       "issues": issues}
+                       "issues": issues, "warnings": info.get("warnings") or []}
         if issues:
             failed += 1
         if not ctx.json_out:
@@ -4500,6 +4536,8 @@ def cmd_inspect(ctx, args):
             LOG.info(f"  verdict            : {verdict}")
             for msg in issues[:20]:
                 LOG.info(f"      {msg}")
+            for msg in (info.get("warnings") or [])[:20]:
+                LOG.warn(f"      {msg}")
     if ctx.json_out:
         print(json.dumps(out, indent=2, sort_keys=True))
     return EXIT_VERIFY if failed else EXIT_OK
@@ -4786,6 +4824,22 @@ CONFIG_TEMPLATE = """\
 
 # ---- consistency ---------------------------------------------------------
 # keep_snapshots = 2               # snapshots kept for rollback and `gc`
+# min_free = 2147483648            # abort mid-transfer below this many bytes (2 GiB)
+# file_retries = 3                 # whole-batch attempts for retryable failures
+# progress_interval = 3600.0       # seconds between periodic progress lines
+
+# ---- adopting an existing download ---------------------------------------
+# adopt = ["/data/public/databases/NT"]  # example; directories to search for
+#                                  # files another tool already downloaded
+# adopt_partial = true             # example; resume half finished files too
+# adopt_extracted = true           # example; also adopt extracted payload that
+#                                  # forms a complete build (tar.gz only)
+
+# ---- logging -------------------------------------------------------------
+# log_file = "/var/log/blastdb.log" # example; also write diagnostics to a file
+# auto_log = true                  # write <root>/log for download/repair/gc/rollback
+# console = "auto"                 # auto | full | errors | off
+# user = "alice"                   # example; whose quota to check
 # reuse_verify = "probe"           # probe | md5 | size
 #                                  #   how hard to re-check an installed file
 #                                  #   before hard-linking it into a new snapshot
@@ -4794,20 +4848,6 @@ CONFIG_TEMPLATE = """\
 # torn_retries = 3                 # extra attempts before giving up (exit code 4)
 # torn_wait = 60.0                 # seconds between those attempts
 # disk_check = true                # refuse to start without enough free space
-# min_free = 2147483648            # abort mid-transfer below this (2 GiB)
-# file_retries = 3                 # whole-batch attempts for retryable failures
-# progress_interval = 3600.0       # seconds between periodic progress lines
-# console = "auto"                 # auto | full | errors | off
-# auto_log = true                  # write <root>/log for download/repair/gc/rollback
-# log_file = "/var/log/blastdb.log" # example; also write diagnostics to a file
-# user = "alice"                   # example; whose quota to check
-
-# ---- adopting an existing download ---------------------------------------
-# adopt = ["/data/public/databases/NT"]  # example; directories to search for
-#                                  # files another tool already downloaded
-# adopt_partial = true             # example; resume half finished files too
-# adopt_extracted = true           # example; also adopt extracted payload that
-#                                  # forms a complete build (tar.gz only)
 
 # ---- content -------------------------------------------------------------
 # with_taxdb = true                # implicitly mirror `taxdb` for cloud sources

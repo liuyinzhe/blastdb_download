@@ -108,7 +108,8 @@ def iso_of(date_str):
 
 def make_revision(dates=("Jul 01, 2026  1:00 AM",), kind="nucl",
                   tag=b"a", size=PAYLOAD, extra_manifest_files=(),
-                  dbname="testdb", meta_last_updated=None):
+                  dbname="testdb", meta_last_updated=None,
+                  meta_bytes_total=None):
     """Build one fake revision of a database (default `testdb`).
 
     Mirrors the real layout: a manifest entry pointing at archives, plus the
@@ -137,7 +138,8 @@ def make_revision(dates=("Jul 01, 2026  1:00 AM",), kind="nucl",
         "number-of-letters": 1000, "number-of-sequences": 10,
         "files": sorted(payload),
         "last-updated": meta_last_updated or iso_of(dates[0]),
-        "bytes-total": sum(len(v) for v in payload.values()),
+        "bytes-total": (meta_bytes_total if meta_bytes_total is not None
+                        else sum(len(v) for v in payload.values())),
         "bytes-to-cache": 0,
         "number-of-volumes": len(dates),
     }
@@ -584,16 +586,22 @@ class TestSetLevelChecks(Case):
         proc = self.run_cli("download", "testdb", expect=3)
         self.assertIn("not contiguous", proc.stderr)
 
-    def test_payload_metadata_disagreeing_with_the_index_is_refused(self):
-        # a single volume database has nothing to compare volumes against, but
-        # its own metadata still states which build it belongs to
+    def test_payload_metadata_from_another_build_is_only_a_warning(self):
+        # NCBI ships stale <db>-<type>-metadata.json artifacts: in the real
+        # 2026-07-21 snapshot the nt one was dated a day later and quoted
+        # ~10 GiB less payload than the snapshot's own 345 volumes, while the
+        # embedded .nin stamps and nt.njs agreed with the payload.  A verified
+        # download must not be refused over that upstream slip (see also
+        # TestStaleUpstreamMetadata for the fatal counterpart).
         self.fake.add("testdb", make_revision(
             dates=("Jul 01, 2026  1:00 AM",),
-            meta_last_updated="2026-07-05T00:00:00"))
-        proc = self.run_cli("download", "testdb", expect=3)
-        self.assertIn("different builds", proc.stderr)
-        self.assertFalse(os.path.islink(os.path.join(self.root, "current")))
-        self.assertEqual(self.snapshots(), [])
+            meta_last_updated="2026-07-05T00:00:00",
+            meta_bytes_total=12345))
+        proc = self.run_cli("download", "testdb", expect=0)
+        self.assertIn("describes a different build", proc.stderr)
+        self.assertIn("stale, ignored", proc.stderr)
+        self.assertNotIn("refusing to install", proc.stderr)
+        self.assertTrue(os.path.islink(os.path.join(self.root, "current")))
 
     def test_manifest_listing_a_file_the_source_cannot_serve_is_torn(self):
         rev = make_revision()
@@ -1248,6 +1256,82 @@ class TestAdoptExisting(Case):
         self.assertIn("not a directory", proc.stderr)
 
 
+class TestStaleUpstreamMetadata(Case):
+    """NCBI publishes stale per-database metadata JSONs in real snapshots.
+
+    Measured on 2026-07-21-01-05-02: `nt-nucl-metadata.json` announced
+    2026-07-20 and ~10 GiB less payload than the 345 volumes in that snapshot,
+    while the `.nin` timestamps, `nt.njs` and the manifest all agreed with each
+    other.  Refusing a *verified* 1 TiB download over that slip would be worse
+    than useless, so the artifact is recognised as foreign and only warned about.
+    """
+
+    def stale_revision(self, **kw):
+        return make_revision(meta_last_updated="2026-07-05T00:00:00",
+                             meta_bytes_total=12345, **kw)
+
+    def test_a_foreign_metadata_json_does_not_block_the_install(self):
+        self.fake.add("testdb", self.stale_revision())
+        proc = self.run_cli("-v", "download", "testdb", expect=0)
+        self.assertIn("describes a different build", proc.stderr)
+        self.assertIn("stale, ignored", proc.stderr)
+        self.assertNotIn("refusing to install", proc.stderr)
+        self.assertTrue(os.path.islink(os.path.join(self.root, "current")))
+        self.run_cli("verify", expect=0)
+
+    def test_the_volume_set_is_still_enforced(self):
+        # a foreign metadata JSON must not excuse a genuinely broken set: the
+        # payload's own volume ordinals have to stay contiguous from 0
+        rev = self.stale_revision(dates=("Jul 01, 2026  1:00 AM",
+                                         "Jul 01, 2026  2:00 AM"))
+        rev["files"] = {k: v for k, v in rev["files"].items()
+                        if not k.startswith("testdb.00.")}
+        self.fake.add("testdb", rev)
+        proc = self.run_cli("download", "testdb", expect=3)
+        self.assertIn("not contiguous from 0", proc.stderr)
+
+    def test_a_matching_metadata_json_is_still_fatal_when_wrong(self):
+        # same build date => the artifact *is* an authority, so a size that
+        # disagrees means the payload is damaged
+        self.fake.add("testdb", make_revision(meta_bytes_total=12345))
+        proc = self.run_cli("download", "testdb", expect=3)
+        self.assertIn("bytes-total 12345", proc.stderr)
+        self.assertNotIn("stale, ignored", proc.stderr)
+
+    def test_inspect_reports_it_as_a_warning_not_a_failure(self):
+        tree = os.path.join(self.root, "tree")
+        os.makedirs(tree)
+        rev = self.stale_revision()
+        with tarfile.open(fileobj=io.BytesIO(rev["files"]["testdb.tar.gz"])) as tf:
+            for member in tf:
+                if member.isfile():
+                    with open(os.path.join(tree, member.name), "wb") as fh:
+                        fh.write(tf.extractfile(member).read())
+        for name, data in rev["extra_objects"].items():
+            with open(os.path.join(tree, name), "wb") as fh:
+                fh.write(data)
+        proc = self.run_cli("inspect", "testdb", "--dir", tree, expect=0)
+        self.assertIn("verdict            : OK", proc.stderr)
+        self.assertIn("different build", proc.stderr)
+
+    def test_inspect_still_fails_on_a_truncated_payload(self):
+        tree = os.path.join(self.root, "tree")
+        os.makedirs(tree)
+        rev = make_revision()                       # metadata json is in-sync
+        with tarfile.open(fileobj=io.BytesIO(rev["files"]["testdb.tar.gz"])) as tf:
+            for member in tf:
+                if member.isfile():
+                    with open(os.path.join(tree, member.name), "wb") as fh:
+                        fh.write(tf.extractfile(member).read())
+        for name, data in rev["extra_objects"].items():
+            with open(os.path.join(tree, name), "wb") as fh:
+                fh.write(data)
+        with open(os.path.join(tree, "testdb.nsq"), "r+b") as fh:
+            fh.truncate(50)
+        proc = self.run_cli("inspect", "testdb", "--dir", tree, expect=3)
+        self.assertIn("bytes-total", proc.stderr)
+
+
 class TestStagingInventory(Case):
     """`staging` answers "how much of that interrupted run is still usable?"."""
 
@@ -1354,7 +1438,8 @@ def main(argv):
     def note(text):
         if logfile:
             with open(logfile, "a", encoding="utf-8") as fh:
-                fh.write("[NOTICE] %s\n" % text)
+                # exactly what aria2 1.37 writes, including the source tag
+                fh.write("[NOTICE] [RequestGroup.cc:1214] %s\n" % text)
 
     if not inputs:
         return 1
@@ -1481,6 +1566,71 @@ class TestAria2Backend(Case):
         self.assertNotIn("source:", proc.stderr,
                          "the bad tool path must be reported before the source "
                          "is even contacted")
+
+
+class TestAria2LogParsing(Case):
+    """aria2's log line shape, taken verbatim from aria2 1.37 output.
+
+    The watcher used to require `[NOTICE] Download complete:` with nothing in
+    between, while aria2 actually writes `[NOTICE] [RequestGroup.cc:1214]
+    Download complete: <path>`.  The fake source was writing the tidy form, so
+    the tests passed while per-file progress never worked in production.
+    """
+
+    REAL_LINES = (
+        "2026-09-28 07:41:37.742903 [NOTICE] [Context.cc:310] Downloading 1 item(s)\n"
+        "2026-09-28 07:41:38.484667 [NOTICE] [RequestGroup.cc:1214] "
+        "Download complete: /data/nt.000.tar.gz\n"
+        "2026-09-28 07:41:38.9 [NOTICE] [RequestGroup.cc:1214] "
+        "Download complete: /data/nt.001.tar.gz\n"
+    )
+
+    class Sink:
+        def __init__(self):
+            self.done = []
+
+        def file_finished(self, name, size=None, seconds=None, rate=None):
+            self.done.append((name, size))
+
+    def test_completion_lines_are_recognised(self):
+        log = os.path.join(self.root, "a2.log")
+        with open(log, "w", encoding="utf-8") as fh:
+            fh.write(self.REAL_LINES)
+        sink = self.Sink()
+        watcher = module.Aria2LogWatcher(log, sink,
+                                         sizes={"nt.000.tar.gz": 123})
+        watcher._drain()
+        self.assertEqual(sink.done, [("nt.000.tar.gz", 123),
+                                     ("nt.001.tar.gz", None)])
+
+    def test_draining_twice_does_not_report_twice(self):
+        log = os.path.join(self.root, "a2.log")
+        with open(log, "w", encoding="utf-8") as fh:
+            fh.write(self.REAL_LINES)
+        sink = self.Sink()
+        watcher = module.Aria2LogWatcher(log, sink)
+        watcher._drain()
+        watcher._drain()
+        self.assertEqual(len(sink.done), 2)
+
+    def test_appended_lines_are_picked_up(self):
+        log = os.path.join(self.root, "a2.log")
+        with open(log, "w", encoding="utf-8") as fh:
+            fh.write(self.REAL_LINES.splitlines(keepends=True)[0])
+        sink = self.Sink()
+        watcher = module.Aria2LogWatcher(log, sink)
+        watcher._drain()
+        self.assertEqual(sink.done, [])
+        with open(log, "a", encoding="utf-8") as fh:
+            fh.write(self.REAL_LINES.splitlines(keepends=True)[1])
+        watcher._drain()
+        self.assertEqual(sink.done, [("nt.000.tar.gz", None)])
+
+    def test_a_missing_log_file_is_not_an_error(self):
+        sink = self.Sink()
+        module.Aria2LogWatcher(os.path.join(self.root, "nope.log"),
+                               sink)._drain()
+        self.assertEqual(sink.done, [])
 
 
 class TestLoggingModes(Case):

@@ -40,6 +40,7 @@ import tempfile
 import threading
 import time
 import unittest
+import unittest.mock as mock
 import urllib.parse
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -172,6 +173,9 @@ class FakeNcbi:
         self.payload_responses = 0
         self.stall_seconds = 20.0
         self.fail_payloads = None     # e.g. 404 to simulate a refusing server
+        self.num_as_str = ()          # manifest number fields published as
+                                      # strings (NCBI really does this for
+                                      # taxdb's number-of-volumes)
         self.fail_names = set()       # refuse exactly these objects
         self.fail_times = {}          # name -> remaining refusals (transient)
         self.fail_code = 404          # code used for fail_names / fail_times
@@ -197,7 +201,7 @@ class FakeNcbi:
             listed += [n for n in rev["extra_manifest_files"] if n not in listed]
             host = self.manifest_host or self.host
             scheme = "ftp" if host.startswith("ftp.") else "http"
-            out.append({
+            entry = {
                 "dbname": dbname,
                 "version": "1.1",
                 "dbtype": "Nucleotide" if rev["kind"] == "nucl" else "Protein",
@@ -209,7 +213,11 @@ class FakeNcbi:
                 "bytes-total": sum(len(v) for v in rev["files"].values()),
                 "bytes-to-cache": 0,
                 "number-of-volumes": len(rev.get("dates", ())) or 1,
-            })
+            }
+            for field in self.num_as_str:
+                if field in entry:
+                    entry[field] = str(entry[field])
+            out.append(entry)
         return json.dumps(out).encode()
 
     def lookup(self, name):
@@ -2599,6 +2607,235 @@ class TestInspect(Case):
         self.build_tree(("Jul 01, 2026  1:00 AM",))
         proc = self.run_cli("inspect", "nosuchdb", expect=3)
         self.assertIn("no files found", proc.stderr)
+
+
+class TestManifestNumberTypes(Case):
+    """NCBI's manifest is not type stable.  `taxdb` is published with
+    `"number-of-volumes": "1"` and `"bytes-total": "294304078"` while `nt`
+    has ints; the planner compares/ divides those fields, so a string used to
+    abort the whole run with `TypeError: '>' not supported between instances
+    of 'str' and 'int'` (seen with `-s auto`/`-s ncbi` on 2026-10-09)."""
+
+    NUM_STR = ("number-of-volumes", "bytes-total", "bytes-total-compressed")
+
+    def test_string_numbers_in_the_manifest_do_not_break_the_plan(self):
+        self.fake.add("testdb", make_revision())
+        self.fake.add("taxdb", make_revision(dbname="taxdb"))
+        self.fake.num_as_str = self.NUM_STR        # exactly what taxdb does
+        out = self.run_cli("--taxdb", "--dry-run", "download", "testdb",
+                           expect=0)
+        self.assertIn("taxdb: rev", out.stdout)
+        # the space arithmetic that used to raise is still performed
+        self.assertRegex(out.stdout, r"about [\d.,]+ [KMG]iB of disk")
+        self.assertNotIn("unexpected TypeError", out.stderr)
+
+    def test_as_int(self):
+        self.assertEqual(module.as_int("1"), 1)
+        self.assertEqual(module.as_int(" 294304078 "), 294304078)
+        self.assertEqual(module.as_int(1.0), 1)
+        self.assertEqual(module.as_int(7), 7)
+        self.assertIsNone(module.as_int(None))
+        self.assertIsNone(module.as_int(True), "bool is not a count")
+        self.assertIsNone(module.as_int("many"))
+        self.assertEqual(module.as_int("many", 0), 0)
+        self.assertEqual(module.as_int(None, 0), 0)
+
+    def test_validate_manifest_coerces_only_parseable_numbers(self):
+        manifest = [{"dbname": "taxdb", "version": "1.1",
+                     "number-of-volumes": "1", "bytes-total": "30",
+                     "bytes-to-cache": "unknown", "description": "d"}]
+        module.validate_manifest(manifest, "https://example.invalid/m.json")
+        self.assertEqual(manifest[0]["number-of-volumes"], 1)
+        self.assertEqual(manifest[0]["bytes-total"], 30)
+        self.assertEqual(manifest[0]["bytes-to-cache"], "unknown",
+                         "a value that is not a number must not be invented)")
+        with self.assertRaises(module.BlastError):
+            module.validate_manifest(["not-a-dict"], "https://x/m.json")
+        with self.assertRaises(module.BlastError):
+            module.validate_manifest({"dbs": []}, "https://x/m.json")
+        with self.assertRaises(module.TornUpdateError):
+            module.validate_manifest([], "https://x/m.json")
+
+    def test_expected_disk_bytes_tolerates_string_fields(self):
+        """The archive peak needs `number-of-volumes` - keep it usable."""
+        files = [module.RemoteFile("taxdb.tar.gz",
+                                   "https://example.invalid/taxdb.tar.gz",
+                                   65481414, None, "none", None)]
+        target = module.DbTarget("taxdb", "Nucleotide", "d",
+                                 "2026-07-21T00:00:00", "1.1", "ncbi",
+                                 "live", "m.json", files, files,
+                                 "1", "294304078", "65481414")
+        self.assertEqual(target.number_of_volumes, 1)
+        self.assertEqual(target.bytes_total, 294304078)
+        self.assertEqual(target.bytes_compressed, 65481414)
+        self.assertEqual(target.expected_disk_bytes(), 294304078 + 65481414)
+        self.assertEqual(target.expected_download_bytes(), 65481414)
+        # an unparseable count falls back to the number of archives
+        odd = module.DbTarget("taxdb", "Nucleotide", "d",
+                              "2026-07-21T00:00:00", "1.1", "ncbi", "live",
+                              "m.json", files, files, "many", "60", "40")
+        self.assertEqual(odd.expected_disk_bytes(), 60 + 40)
+
+
+class TestAutoSource(Case):
+    """`-s auto`: probe the mirrors, keep NCBI as the last resort."""
+
+    def ctx(self):
+        cfg = dict(module.DEFAULTS)
+        cfg["root"] = os.path.join(self.root, "root")
+        cfg["source"] = "auto"
+        return module.Context(cfg, argparse.Namespace(command="showall",
+                                                      databases=[]))
+
+    def install_current(self, source, name=None):
+        name = name or f"{source}-2026-07-21-01-05-02-deadbeef"
+        snap = os.path.join(self.root, "root", name)
+        os.makedirs(snap)
+        with open(os.path.join(snap, module.STATE_BASENAME), "w", encoding="utf-8") as fh:
+            json.dump({"tool": module.PROGRAM, "format": module.STATE_FORMAT,
+                       "source": source, "created": "2026-07-22T00:00:00Z",
+                       "dbs": {}}, fh)
+        os.symlink(name, os.path.join(self.root, "root", "current"))
+        return name
+
+    def test_order_prefers_the_installed_mirror(self):
+        ctx = self.ctx()
+        self.assertEqual(module.auto_source_order(ctx), ["gcp", "aws"])
+        self.install_current("aws")
+        self.assertEqual(module.auto_source_order(ctx), ["aws", "gcp"],
+                         "a repeat run must not re-download the whole tree "
+                         "just because the other mirror is up too")
+
+    def test_ncbi_is_not_a_probe_candidate(self):
+        ctx = self.ctx()
+        self.install_current("ncbi")
+        self.assertEqual(module.auto_source_order(ctx), ["gcp", "aws"])
+
+    def test_first_mirror_that_answers_wins(self):
+        ctx = self.ctx()
+        with mock.patch.object(module.GcpSource, "probe", return_value=True):
+            self.assertIsInstance(module.open_source(ctx), module.GcpSource)
+        with mock.patch.object(module.GcpSource, "probe", return_value=False), \
+                mock.patch.object(module.AwsSource, "probe", return_value=True):
+            self.assertIsInstance(module.open_source(ctx), module.AwsSource)
+        with mock.patch.object(module.GcpSource, "probe", return_value=False), \
+                mock.patch.object(module.AwsSource, "probe", return_value=False), \
+                mock.patch.object(module.NcbiSource, "resolve", return_value=None):
+            self.assertIsInstance(module.open_source(ctx), module.NcbiSource)
+
+    def test_installed_mirror_is_probed_first(self):
+        ctx = self.ctx()
+        self.install_current("aws")
+        probed = []
+
+        def note(key):
+            probed.append(key)
+            return key == "aws"
+
+        with mock.patch.object(module.GcpSource, "probe",
+                               side_effect=lambda: note("gcp")), \
+                mock.patch.object(module.AwsSource, "probe",
+                                  side_effect=lambda: note("aws")):
+            src = module.open_source(ctx)
+        self.assertIsInstance(src, module.AwsSource)
+        self.assertEqual(probed, ["aws"], "gcp must not even be probed")
+
+    def test_cloud_probe_is_one_latest_dir_get(self):
+        class Stub:
+            def __init__(self, answer):
+                self.answer = answer
+                self.requests = []
+
+            def get_text(self, url, **kw):
+                self.requests.append(url)
+                if isinstance(self.answer, Exception):
+                    raise self.answer
+                return self.answer
+
+        ctx = self.ctx()
+        src = module.GcpSource(ctx)
+        good = Stub("2026-10-06-01-05-02\n")
+        self.assertTrue(src.probe(http=good))
+        self.assertEqual(src.snapshot, "2026-10-06-01-05-02",
+                         "a successful probe pins the snapshot")
+        self.assertTrue(good.requests[0].endswith("/latest-dir"))
+        self.assertFalse(src.probe(http=Stub("<html>go away</html>")))
+        self.assertFalse(src.probe(http=Stub(module.BlastError("no route"))))
+
+
+class TestSourceSwitch(Case):
+    """What happens when the operator switches mirrors between runs.
+
+    `source_key` is part of the revision signature and gates file reuse, so
+    requesting the same databases from the other mirror fetches them again -
+    the installed tree is kept (carried) for everything *not* requested.
+    """
+
+    FILES = (("testdb.nin", 100, "a" * 32), ("testdb.nsq", 200, "b" * 32))
+
+    def ctx(self):
+        cfg = dict(module.DEFAULTS)
+        cfg["root"] = os.path.join(self.root, "root")
+        return module.Context(cfg, argparse.Namespace(command="download",
+                                                      databases=["testdb"]))
+
+    def target(self, source_key):
+        files = [module.RemoteFile(n, f"https://example.invalid/{n}", size, md5,
+                                   "test", None)
+                 for n, size, md5 in self.FILES]
+        return module.DbTarget("testdb", "Nucleotide", "d",
+                               "2026-07-21T00:00:00", "1.1", source_key,
+                               "2026-07-21-01-05-02", "m.json", files, [],
+                               len(files),
+                               sum(s for _n, s, _m in self.FILES),
+                               sum(s for _n, s, _m in self.FILES))
+
+    def gcp_snapshot(self):
+        gcp = self.target("gcp")
+        name = "gcp-2026-07-21-01-05-02-deadbeef"
+        snap = os.path.join(self.root, "root", name)
+        os.makedirs(snap)
+        for n, size, _md5 in self.FILES:
+            with open(os.path.join(snap, n), "wb") as fh:
+                fh.write(b"x" * size)
+        state = {"tool": module.PROGRAM, "format": module.STATE_FORMAT,
+                 "source": "gcp", "created": "2026-07-22T00:00:00Z",
+                 "dbs": {"testdb": {
+                     "revkey": gcp.revkey(), "source_key": "gcp",
+                     "source_snapshot": "2026-07-21-01-05-02",
+                     "files": {n: {"size": s, "md5": m, "md5_origin": "t",
+                                    "role": "payload"}
+                               for n, s, m in self.FILES}}}}
+        with open(os.path.join(snap, module.STATE_BASENAME), "w", encoding="utf-8") as fh:
+            json.dump(state, fh)
+        os.symlink(name, os.path.join(self.root, "root", "current"))
+        return gcp, module.Snapshot(os.path.join(self.root, "root"), name)
+
+    def test_the_source_is_part_of_the_revision_signature(self):
+        self.assertNotEqual(self.target("gcp").revkey(),
+                            self.target("aws").revkey())
+
+    def test_same_source_reuses_the_installed_files(self):
+        ctx = self.ctx()
+        gcp, prev = self.gcp_snapshot()
+        src = module.GcpSource(ctx)
+        self.assertEqual(module.compute_work(src, [gcp], prev, force=False), [],
+                         "an unchanged gcp revision is already installed")
+        reuse, pending = module.split_reuse(ctx, gcp, prev, allow_reuse=True)
+        self.assertEqual(sorted(reuse), ["testdb.nin", "testdb.nsq"])
+        self.assertEqual(pending, [])
+
+    def test_other_source_refetches_the_requested_database(self):
+        ctx = self.ctx()
+        _gcp, prev = self.gcp_snapshot()
+        aws = self.target("aws")
+        src = module.AwsSource(ctx)
+        work = module.compute_work(src, [aws], prev, force=False)
+        self.assertEqual([t.dbname for t in work], ["testdb"],
+                         "the same build from another mirror is fetched again")
+        reuse, pending = module.split_reuse(ctx, aws, prev, allow_reuse=True)
+        self.assertEqual(reuse, {}, "cross-source files are never reused")
+        self.assertEqual(len(pending), len(self.FILES))
 
 
 class TestDryRunAndConfig(Case):

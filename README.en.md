@@ -241,9 +241,18 @@ checked live on 2026-09-24.
   retry or abort when a release is being published.
 - **`-s aws`** → only when AWS connectivity is clearly faster or credentials
   require it; note that large files have no md5 to check against.
+- **Rather not choose** → `-s auto`: probe `gcp` then `aws` (one `latest-dir`
+  request each, 5-20 s timeout; the mirror that already holds the installed
+  snapshot is probed first) and use whichever answers, falling back to `ncbi`
+  with a warning only when neither does.
 - **Both** → build an immutable baseline with `-s gcp` (usable and fully
-  verifiable immediately), then chase updates with `-s ncbi` as needed;
-  unchanged files are hard-linked between the two, so nothing is stored twice.
+  verifiable immediately), then chase updates with `-s ncbi` as needed.  Every
+  database that is *not* requested is hard-linked out of the previous snapshot,
+  so nothing is stored twice.
+  Once the source changes, however, every *requested* database is downloaded
+  again (`revkey` contains the source, and file reuse requires the same source).
+  To avoid that pass, add `--adopt <old snapshot dir>`: files are hard-linked
+  only after verifying them against the **new** source's published md5.
 - **Do not mix sources for the same database in one `--root`**: it works (the
   `current` tree carries unchanged databases over), but a cloud `taxdb` and a
   taxonomy payload bundled inside an NCBI archive can come from different builds;
@@ -418,7 +427,7 @@ sub-command.
 |---|---|
 | `-r, --root DIR` | Mirror root holding the snapshots and `current` (default `./blastdb`) |
 | `-c, --config FILE` | Use this configuration file only |
-| `-s, --source {gcp,aws,ncbi,auto}` | Data source, default `gcp`; `ncbi` is freshest, `auto` prefers `ncbi` |
+| `-s, --source {gcp,aws,ncbi,auto}` | Data source, default `gcp`; `ncbi` is freshest, `auto` probes `gcp` then `aws` (starting with the mirror already installed) and falls back to `ncbi` only when neither answers |
 | `--ncbi-dir PATH` | NCBI directory, default `/blast/db` (e.g. `/blast/db/v5`) |
 | `--ncbi-base URL` | Origin of the NCBI tree or a regional replica; setting it also redirects payload URLs |
 | `--ncbi-url {auto,mirror,manifest}` | `mirror` fetches `<file>` from `--ncbi-base`/`--ncbi-dir`; `manifest` uses the published URL (`ftp://` becomes `https://`) |
@@ -520,7 +529,7 @@ python3 blastdb_download.py -r /data/blastdb config | jq '{config_file, config_s
 
 ```toml
 [general]
-source = "ncbi"              # gcp | aws | ncbi | auto
+source = "ncbi"              # gcp | aws | ncbi | auto (auto probes gcp/aws first)
 jobs = 8
 keep_snapshots = 2
 reuse_verify = "probe"       # probe | md5 | size

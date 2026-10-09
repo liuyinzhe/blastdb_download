@@ -287,8 +287,12 @@ python3 blastdb_download.py config --template          # 只打印，不写盘
 - **要"新"** → `-s ncbi`：工具的一致性协议本来就是为这个"可变目录"设计的（下载前后各读一次修订指纹、
   校验内嵌构建时间戳），代价是撞上发布窗口时可能重试或中止，等一会儿再跑即可。
 - **`-s aws`** → 只在 AWS 通道明显更快或有凭证要求时用；注意它对大文件没有 md5 可校验。
+- **不想手动选** → `-s auto`：先探测 `gcp`、`aws`（每个源一次 `latest-dir` 请求，5–20 秒超时；
+  已有快照时**装着数据的那一个源优先**），哪个通就用哪个，两个都不通才回退 `ncbi` 并告警。
 - **两者兼得** → 先用 `-s gcp` 建一份**不可变基线**（马上可用、可全量校验），之后再按需 `-s ncbi` 追新；
-  两次运行的未变动文件会**硬链接复用**，不会重复占盘。
+  **没有被请求的库**会从上一个快照硬链接带过来，不重复占盘。
+  但换了源以后，**被请求的库会整份重新下载**（`revkey` 里含源标识，同源才复用文件）；
+  想省这一遍就加 `--adopt <旧快照目录>`：工具会按**新源公布的 md5** 校验后硬链接，能证的才复用。
 - **不要在同一个 `--root` 里混着用不同源**去装同一个库：技术上可行（`current` 会把未变动的库带过来），
   但跨源的 `taxdb` 与归档自带的 taxonomy 可能来自不同构建，工具会按"构建时间取新"决定并告警。
 
@@ -412,7 +416,7 @@ revkey(db)   := sha1(来源 | 快照 | 库名 | revision(db))
 |---|---|
 | `-r, --root DIR` | 镜像根目录，存放各快照与 `current`（默认 `./blastdb`） |
 | `-c, --config FILE` | 指定配置文件（独占，不再查找其它位置） |
-| `-s, --source {gcp,aws,ncbi,auto}` | 数据源，默认 `gcp`。`ncbi` 最新；`auto` 优先 `ncbi` |
+| `-s, --source {gcp,aws,ncbi,auto}` | 数据源，默认 `gcp`。`ncbi` 最新；`auto` 先探测 `gcp`、`aws`（已装快照的那个源优先），两者都不通才回退 `ncbi` |
 | `--ncbi-dir PATH` | NCBI 目录，默认 `/blast/db`（也可指 `/blast/db/v5`） |
 | `--ncbi-base URL` | NCBI 树/镜像的 origin，默认 `https://ftp.ncbi.nlm.nih.gov`。**指定后载荷 URL 一并重定向** |
 | `--ncbi-url {auto,mirror,manifest}` | `mirror`：从 `--ncbi-base`+`--ncbi-dir` 取文件；`manifest`：用清单里发布的 URL（`ftp://`→`https://`）。默认 `auto` |
@@ -514,7 +518,7 @@ python3 blastdb_download.py -r /data/blastdb config | jq '{config_file, config_s
 
 ```toml
 [general]
-source = "ncbi"              # 想长期走 NCBI 就写这里
+source = "ncbi"              # gcp | aws | ncbi | auto（auto：探测 gcp/aws，都不通才用 ncbi）
 jobs = 8
 keep_snapshots = 2
 reuse_verify = "probe"       # probe | md5 | size

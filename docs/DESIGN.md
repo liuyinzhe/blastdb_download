@@ -180,6 +180,10 @@ DbTarget    : dbname, dbtype, source_key, snapshot_id, files[], archives[],
 返回同一 `revkey`、对不同内容返回不同 `revkey`。若能提供逐文件 md5，请放在 `RemoteFile.md5`
 （`md5_origin` 写明来源，`verification` 会如实汇报）。
 
+若这个源要被 `--source auto` 探测，再实现 `probe(http=None) -> bool`：必须是**一次便宜且带短超时**
+的请求，成功时把 `snapshot_id()` 一并钉住（`CloudSource.probe()` 取的就是 `latest-dir`），
+失败返回 `False` 而不是抛异常；并把源加进 `AUTO_SOURCE_ORDER`。
+
 **加校验**：优先使用**载荷自带**的证据（内嵌指纹、`bytes-total`、清单里的文件列表），
 在 `verify_table()` / `check_database_metadata()` 里以"issue 字符串"形式追加，并加一条测试
 （正例 + 反例）。不要引入新的远端声明作为权威。

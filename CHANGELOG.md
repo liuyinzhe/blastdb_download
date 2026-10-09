@@ -9,6 +9,50 @@ have been wrong, or a failure was misreported). **Security** is not used as a
 separate heading here because the whole point of the tool is data integrity, so
 integrity fixes are listed under **Fixed**.
 
+## [1.4.8] — 2026-10-09
+
+A live-manifest crash on the NCBI path, and an `--source auto` that never
+tested anything.
+
+### Fixed
+
+- **A string `number-of-volumes` aborted every NCBI run that included `taxdb`.**
+  NCBI's manifest is not type stable: `nt` is published with
+  `"number-of-volumes": 399` (an integer) while `taxdb` has `"1"` (a string).
+  The space check divides by that field - `max(1, self.number_of_volumes or
+  len(self.archives))` - so the comparison raised `ERROR: unexpected TypeError:
+  '>' not supported between instances of 'str' and 'int'` during planning, i.e.
+  before a single byte was transferred.  Because `taxdb` is added implicitly,
+  `download nt core_nt` failed on that; `--no-taxdb` worked, and `-s gcp`/`-s
+  aws` were unaffected because cloud targets carry no archives and never reach
+  that branch - which is exactly why `-s aws` looked like a workaround.
+  Manifest numbers are now normalized where the manifest is validated
+  (`validate_manifest`), `DbTarget` coerces them as well (so states written by
+  an older version are safe too), and both space calculations tolerate anything
+  left over.  `TestManifestNumberTypes` reproduces the real shape (string
+  `number-of-volumes` plus an archive) end to end and against `--dry-run`.
+- **`validate_manifest` only inspected the first entry.**  A manifest whose
+  *later* entry was not an object failed much further down with an
+  `AttributeError` from some `.get()`; it is now a `BlastError` naming the
+  manifest, and every entry is type-normalized in the same pass.
+
+### Changed
+
+- **`--source auto` now probes the mirrors instead of quietly meaning `ncbi`.**
+  `auto` used to be translated to `ncbi` with a single assignment and no
+  request at all, so "auto" actually picked the slowest and most mutable
+  source.  It now probes `gcp` and then `aws` with one short-timeout
+  `latest-dir` GET each (5-20 s, clamped `--timeout`) and only falls back to the
+  live NCBI directory when neither answers; the fallback is logged as a
+  warning, because that directory can change mid-transfer.
+  When a snapshot is already installed its mirror is probed first: both mirrors
+  carry the same build, but `source_key` is part of `revkey()` and gates file
+  reuse (`split_reuse`), so switching mirrors re-downloads every *requested*
+  database.  Staying on the installed mirror keeps a repeat run cheap.
+  `CloudSource.probe()` pins the snapshot, so a successful probe costs no extra
+  round trip.  `TestAutoSource` covers the order, the fallback and the probe;
+  `TestSourceSwitch` pins the cross-source re-download behaviour.
+
 ## [1.4.7] — 2026-09-28
 
 A fresh review of the corners not audited before: the CLI's stdout contract,

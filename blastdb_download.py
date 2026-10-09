@@ -100,7 +100,7 @@ try:                                    # Python >= 3.11
 except ModuleNotFoundError:             # pragma: no cover
     tomllib = None
 
-__version__ = "1.4.7"
+__version__ = "1.4.8"
 PROGRAM = "blastdb_download.py"
 STATE_BASENAME = ".blastdb-download.json"
 STATE_FORMAT = 1
@@ -114,6 +114,13 @@ S3_ROOT = "https://s3.amazonaws.com"
 S3_BUCKET = "ncbi-blast-databases"
 METADATA_JSON = "blastdb-metadata-1-1.json"
 MANIFEST_VERSIONS = {"1.1"}
+
+#: cloud mirrors `--source auto` probes, in order, after the mirror that is
+#: already installed (see `auto_source_order`)
+AUTO_SOURCE_ORDER = ("gcp", "aws")
+#: `--source auto` probe budget per mirror: clamped `--timeout`
+AUTO_PROBE_TIMEOUT_MIN = 5.0
+AUTO_PROBE_TIMEOUT_MAX = 20.0
 
 EXIT_OK, EXIT_ERR, EXIT_VERIFY, EXIT_TORN = 0, 1, 3, 4
 UA = f"{PROGRAM}/{__version__}"
@@ -282,6 +289,29 @@ def parse_size(text: str) -> int:
     if not m:
         raise argparse.ArgumentTypeError(f"invalid size: {text!r}")
     return int(float(m.group(1)) * _SIZE_MULT[m.group(2).lower()])
+
+
+def as_int(value, default=None):
+    """Best effort integer for values that reach arithmetic code.
+
+    NCBI's manifest is not type stable: it publishes
+    ``"number-of-volumes": 399`` for `nt` but ``"1"`` (a string) for `taxdb`,
+    and the planner does arithmetic on that field (``max(1, nvol)``,
+    ``// nvol``).  A string reaching it used to abort the whole run with
+    ``TypeError: '>' not supported between instances of 'str' and 'int'``.
+    Values that are not numbers at all are returned as they came, so nothing
+    is silently invented - only the arithmetic sites fall back to ``default``.
+    """
+    if value is None or isinstance(value, bool):
+        return default
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        return int(value)
+    try:
+        return int(str(value).strip())
+    except (TypeError, ValueError):
+        return default
 
 
 def human_duration(seconds) -> str:
@@ -1090,6 +1120,7 @@ class Http:
                  insecure: bool = False):
         self.timeout = float(timeout)
         self.tries = max(1, int(tries))
+        self.insecure = bool(insecure)
         ctx = ssl.create_default_context()
         if insecure:
             ctx.check_hostname = False
@@ -2082,9 +2113,9 @@ class DbTarget:
         self.manifest_url = manifest_url
         self.files = files            # everything that must land in the tree
         self.archives = archives      # transport-only .tar.gz members of `files`
-        self.number_of_volumes = number_of_volumes
-        self.bytes_total = bytes_total
-        self.bytes_compressed = bytes_compressed
+        self.number_of_volumes = as_int(number_of_volumes, number_of_volumes)
+        self.bytes_total = as_int(bytes_total, bytes_total)
+        self.bytes_compressed = as_int(bytes_compressed, bytes_compressed)
         self.keep_archives = False
 
     def signature(self) -> str:
@@ -2099,8 +2130,9 @@ class DbTarget:
         return sha1_hex(self.signature())[:16]
 
     def expected_download_bytes(self):
-        if self.bytes_compressed and self.archives:
-            return self.bytes_compressed
+        compressed = as_int(self.bytes_compressed)
+        if compressed and self.archives:
+            return compressed
         sizes = [rf.size for rf in self.files if rf.size]
         return sum(sizes) if sizes else None
 
@@ -2112,16 +2144,27 @@ class DbTarget:
         dropped from staging as soon as they are unpacked (unless
         --keep-archives), so the peak is `payload + one archive` rather than
         `payload + all archives`.
+
+        Every size is coerced with `as_int` first: a manifest that publishes
+        `"number-of-volumes": "1"` (taxdb does) must not turn a space check
+        into a `TypeError`.
         """
         if self.archives:
-            payload = self.bytes_total or 0
+            payload = as_int(self.bytes_total, 0) or 0
+            compressed = as_int(self.bytes_compressed, 0) or 0
             if self.keep_archives:
-                return max(payload + (self.bytes_compressed or 0),
-                           self.bytes_compressed or 0) or None
-            nvol = max(1, self.number_of_volumes or len(self.archives))
-            one_archive = (self.bytes_compressed or 0) // nvol
+                return max(payload + compressed, compressed) or None
+            nvol = max(1, as_int(self.number_of_volumes) or len(self.archives))
+            one_archive = compressed // nvol
             return (payload + one_archive) or None
         return self.expected_download_bytes()
+
+
+#: manifest fields the planner does arithmetic on.  NCBI publishes some of
+#: them as strings (`taxdb` has `"number-of-volumes": "1"`), see `as_int`.
+NUMERIC_MANIFEST_FIELDS = ("number-of-volumes", "number-of-sequences",
+                           "number-of-letters", "bytes-total",
+                           "bytes-total-compressed", "bytes-to-cache")
 
 
 def validate_manifest(obj, url: str) -> None:
@@ -2132,9 +2175,15 @@ def validate_manifest(obj, url: str) -> None:
     if not isinstance(obj, list):
         raise BlastError(f"invalid BLAST database manifest at {url}: "
                          f"expected a JSON array")
+    for entry in obj:
+        if not isinstance(entry, dict):
+            raise BlastError(f"invalid manifest entry in {url}")
+        # normalize the numeric fields once, here, so every consumer
+        # (`revision`, `list_databases`, the space check) sees ints
+        for field in NUMERIC_MANIFEST_FIELDS:
+            if field in entry:
+                entry[field] = as_int(entry[field], entry[field])
     first = obj[0]
-    if not isinstance(first, dict):
-        raise BlastError(f"invalid manifest entry in {url}")
     if first.get("version") not in MANIFEST_VERSIONS:
         LOG.warn(f"manifest {url} declares version {first.get('version')!r}, "
                  f"expected one of {sorted(MANIFEST_VERSIONS)}")
@@ -2157,6 +2206,19 @@ class Source:
     def list_databases(self):               raise NotImplementedError
     def revision(self, dbname, fresh=False): raise NotImplementedError
     def invalidate(self):                   pass
+
+    def probe(self, http=None) -> bool:
+        """Reachability check used by `--source auto` (default: `resolve()`).
+
+        `http` lets the caller supply a short timeout client; subclasses that
+        can probe more cheaply override this.
+        """
+        try:
+            self.resolve()
+            return True
+        except BlastError as exc:
+            LOG.info(f"source probe: {self.key} did not answer ({exc})")
+            return False
 
     def snapshot_label(self) -> str:
         return str(self.snapshot_id())
@@ -2185,6 +2247,32 @@ class CloudSource(Source):
             raise BlastError(f"unexpected latest-dir content at {url}: {text!r}")
         self.snapshot = text
         LOG.verbose(f"{self.key}: latest-dir = {text}")
+
+    def probe(self, http=None) -> bool:
+        """`--source auto`: one `latest-dir` GET, with a short timeout.
+
+        A black-holed host must not cost `--timeout` x `--tries` before the
+        next mirror is tried, so the probe gets its own client.  On success the
+        snapshot is pinned exactly like `resolve()` would have, so a probe
+        never costs an extra round trip afterwards.
+        """
+        url = f"{self.root}/{self.bucket}/latest-dir"
+        hook = http or Http(timeout=max(AUTO_PROBE_TIMEOUT_MIN,
+                                        min(self.http.timeout,
+                                            AUTO_PROBE_TIMEOUT_MAX)),
+                            tries=1, insecure=self.http.insecure)
+        try:
+            text = hook.get_text(url, attempts=1).strip()
+        except BlastError as exc:
+            LOG.info(f"source probe: {self.key} did not answer ({exc})")
+            return False
+        if not re.match(r"^\d{4}-\d{2}-\d{2}(-\d{2}-\d{2}-\d{2})?$", text):
+            LOG.warn(f"source probe: {self.key} answered, but {url} is not a "
+                     f"snapshot pointer ({text!r}); not using this source")
+            return False
+        self.snapshot = text
+        LOG.verbose(f"source probe: {self.key} reachable, latest-dir = {text}")
+        return True
 
     def snapshot_id(self):
         return self.snapshot
@@ -2551,18 +2639,71 @@ class NcbiSource(Source):
                         entry.get("bytes-total-compressed"))
 
 
+def make_source(ctx, key) -> Source:
+    """Build a source object without touching the network."""
+    if key == "gcp":
+        return GcpSource(ctx)
+    if key == "aws":
+        return AwsSource(ctx)
+    if key == "ncbi":
+        return NcbiSource(ctx, ctx.ncbi_dir, ctx.ncbi_base)
+    raise BlastError(f"unknown source {key!r}")
+
+
+def installed_source_key(ctx):
+    """`source_key` of the snapshot `current` points at, or None.
+
+    `--source auto` uses it to stay on the mirror that is already installed:
+    both mirrors carry the same build, but switching keys makes every
+    *requested* database download again (see `split_reuse`).
+    """
+    try:
+        snap = ctx.store.current()
+        return snap.state.get("source") if snap else None
+    except Exception:                        # advisory only, never fatal
+        return None
+
+
+def auto_source_order(ctx):
+    """Cloud mirrors `--source auto` probes, most preferred first.
+
+    The mirror already installed comes first, then gcp (real md5Hash per
+    object, no archive handling), then aws.  NCBI is not in this list: it is
+    the live mutable directory and is only used when no mirror answers.
+    """
+    order = []
+    current = installed_source_key(ctx)
+    if current in AUTO_SOURCE_ORDER:
+        order.append(current)
+    order.extend(k for k in AUTO_SOURCE_ORDER if k not in order)
+    return order
+
+
+def open_auto_source(ctx) -> Source:
+    """`--source auto`: first mirror that answers, NCBI only as a last resort."""
+    skipped = []
+    for key in auto_source_order(ctx):
+        src = make_source(ctx, key)
+        if src.probe():
+            LOG.info(f"source auto: {src.describe()}"
+                     + (f" ({', '.join(skipped)} did not answer)"
+                        if skipped else ""))
+            return src
+        skipped.append(key)
+    LOG.warn(f"source auto: no mirror answered ({', '.join(skipped)}); falling "
+             f"back to the live NCBI directory. It is mutable, so a "
+             f"publication window there can force a retry - the tool detects "
+             f"that and never installs a mixed set")
+    src = make_source(ctx, "ncbi")
+    src.resolve()
+    return src
+
+
 def open_source(ctx) -> Source:
     key = (ctx.source or "gcp").lower()
     if key == "auto":
-        key = "ncbi"
-    if key == "gcp":
-        src = GcpSource(ctx)
-    elif key == "aws":
-        src = AwsSource(ctx)
-    elif key == "ncbi":
-        src = NcbiSource(ctx, ctx.ncbi_dir, ctx.ncbi_base)
-    else:
-        raise BlastError(f"unknown source {ctx.source!r}")
+        return open_auto_source(ctx)
+    src = make_source(ctx, key)
     src.resolve()
     return src
 
@@ -5108,6 +5249,9 @@ CONFIG_TEMPLATE = """\
 # root = "/data/blastdb"            # example; mirror root: snapshots + `current`
 # source = "gcp"                    # gcp | aws | ncbi | auto
 #                                  #   gcp/aws: immutable snapshot, ~1 month behind
+#                                  #   auto:    first of gcp/aws that answers
+#                                  #            (the installed one first);
+#                                  #            ncbi only as a last resort
 #                                  #   ncbi:    freshest, torn-update protection
 # ncbi_dir = "/blast/db"            # NCBI directory, e.g. /blast/db/v5
 # ncbi_base = "https://ftp.ncbi.nlm.nih.gov"
@@ -5190,7 +5334,11 @@ def global_option_specs():
                                 help="mirror root holding the snapshot trees "
                                      "(default: ./blastdb)")),
         (("-s", "--source"), dict(choices=["gcp", "aws", "ncbi", "auto"],
-                                  help="where to download from (default: gcp)")),
+                                  help="where to download from (default: gcp); "
+                                       "auto probes gcp and aws (starting "
+                                       "with the mirror already installed) "
+                                       "and uses the live NCBI directory "
+                                       "only when neither answers")),
         (("--ncbi-dir",), dict(metavar="PATH",
                                help=f"NCBI directory (default {NCBI_DEFAULT_DIR})")),
         (("--ncbi-base",), dict(metavar="URL",

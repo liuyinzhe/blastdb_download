@@ -104,6 +104,12 @@ Useful habits:
    plus a `ruff check` pass restricted to the correctness rule families
    (F, E9, B) if you have ruff installed.
 6. Commit with a message that names the version, as in the existing history.
+   This repository is public: keep the message and the diff free of private
+   details (no internal paths, host names, addresses or credentials), and commit
+   with the repository identity - `user.name` plus the GitHub noreply
+   `user.email` - rather than a machine or work address.
+7. Push to `origin main` over SSH, then confirm the remote caught up:
+   `git fetch && git rev-parse HEAD origin/main` (the two hashes must match).
 
 ## Project layout
 

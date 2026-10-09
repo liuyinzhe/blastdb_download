@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+
+# 镜像数据与运行产物（不要提交）
+blastdb/
+*.blparts.json
+*.aria2
+current
+
+# NCBI 的参考实现：只放在本地对照行为，不随本仓库分发
+update_blastdb.pl
